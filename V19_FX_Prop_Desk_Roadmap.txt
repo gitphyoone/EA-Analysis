@@ -1,0 +1,176 @@
+
+V19 FX Proprietary Desk Development Roadmap
+
+Phase 1 – Core Signal Engine
+1. Build PostgreSQL database:
+   - market_data
+   - trades
+   - trade_history
+   - quant_journal
+
+2. Build MT4 Data Collector:
+   - Collect H1 candle data
+   - EMA50, EMA200, RSI14, ADX14, ATR14
+   - Send data to FastAPI
+
+3. Build Rule-Based Signal Engine:
+   BUY:
+   - EMA50 > EMA200
+   - RSI > 55
+   - ADX > 25
+
+   SELL:
+   - EMA50 < EMA200
+   - RSI < 45
+   - ADX > 25
+
+   Otherwise:
+   - NO_TRADE
+
+Phase 2 – Risk Engine
+
+1. Risk per trade:
+   - 0.25% of account equity
+
+2. Stop Loss:
+   - ATR × 1.5
+
+3. Take Profit:
+   - ATR × 3.0
+
+4. Lot Size Formula:
+   Lots = Risk Amount / (Stop Loss Pips × Pip Value)
+
+5. Circuit Breakers:
+   - Daily DD = 3%
+   - Weekly DD = 6%
+   - Monthly DD = 10%
+
+Phase 3 – Portfolio Engine
+
+1. Maximum open positions:
+   - 3 trades
+
+2. Currency exposure basket:
+   - USD
+   - EUR
+   - GBP
+   - JPY
+   - AUD
+   - CAD
+
+3. Exposure limit:
+   - Absolute exposure <= Equity × 2
+
+4. Correlation filter:
+   - Calculate rolling correlation
+   - Reject new trade if correlation > 0.80
+
+Phase 4 – News Engine
+
+1. Connect economic calendar API:
+   - Forex Factory
+   - MyFXBook
+   - TradingEconomics
+
+2. Store:
+   - Event
+   - Currency
+   - Impact
+   - Time
+
+3. Trading restrictions:
+   - No trading 30 minutes before red news
+   - No trading 30 minutes after red news
+
+Phase 5 – Session Engine
+
+Trade only during:
+- London Session
+- New York Session
+- London/New York Overlap
+
+Avoid low-liquidity periods whenever possible.
+
+Phase 6 – Trade Management
+
+1. Entry executed
+
+2. At +1R:
+   - Move Stop Loss to Break-Even
+
+3. At +2R:
+   - Close 50% position
+
+4. Remaining position:
+   - ATR trailing stop
+
+Phase 7 – Journal Engine
+
+Store every closed trade:
+
+- Ticket
+- Symbol
+- Entry Price
+- Exit Price
+- Stop Loss
+- Take Profit
+- Spread
+- Commission
+- Swap
+- Net PnL
+- R-Multiple
+
+Phase 8 – Analytics Dashboard
+
+Dashboard:
+- Equity Curve
+- Open Positions
+- Daily Performance
+
+Performance:
+- Win Rate
+- Profit Factor
+- Sharpe Ratio
+- Expectancy
+
+Risk:
+- Daily Drawdown
+- Weekly Drawdown
+- Monthly Drawdown
+
+Trade History:
+- Full trade records
+
+Phase 9 – Validation
+
+1. Walk-Forward Analysis
+2. Out-of-Sample Testing
+3. Forward Demo Testing (minimum 3 months)
+4. Small Live Account ($500–$2,000)
+5. Gradual Scaling
+
+Final Architecture
+
+MT4 / MT5
+    ↓
+FastAPI
+    ↓
+Signal Engine
+    ↓
+Risk Engine
+    ↓
+Portfolio Engine
+    ↓
+News Engine
+    ↓
+Execution Engine
+    ↓
+Journal Engine
+    ↓
+PostgreSQL
+    ↓
+Dashboard
+
+Goal:
+Build a stable, risk-controlled FX proprietary trading system suitable for personal capital, managed accounts, and future prop-desk expansion.

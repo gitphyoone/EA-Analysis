@@ -1,0 +1,92 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: ea_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ea_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ea_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-ea_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/migrations:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ea_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ea_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: ea_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-ea_user}:${POSTGRES_PASSWORD:-ea_pass}@postgres:5432/${POSTGRES_DB:-ea_db}
+      REDIS_URL: redis://redis:6379/0
+      API_SECRET_KEY: ${API_SECRET_KEY:-change_me_in_production}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    ports:
+      - "80:8000"
+    volumes:
+      - ./backend:/app
+      - ./dashboard:/dashboard
+
+  # FIX: automated daily PostgreSQL backup — prevents total data loss on volume corruption
+  # Dumps to ./backups/ea_db_YYYYMMDD_HHMMSS.sql.gz every day at 02:00 UTC
+  db-backup:
+    image: postgres:15-alpine
+    container_name: ea_db_backup
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-ea_pass}
+    volumes:
+      - ./backups:/backups
+    entrypoint: >
+      sh -c "
+        while true; do
+          FNAME=/backups/ea_db_$$(date +%Y%m%d_%H%M%S).sql.gz;
+          pg_dump -h postgres -U ${POSTGRES_USER:-ea_user} ${POSTGRES_DB:-ea_db} | gzip > $$FNAME;
+          echo \"Backup written: $$FNAME\";
+          find /backups -name '*.sql.gz' -mtime +30 -delete;
+          sleep 86400;
+        done
+      "
+
+  adminer:
+    image: adminer:latest
+    container_name: ea_adminer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres_data:
