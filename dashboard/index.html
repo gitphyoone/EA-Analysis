@@ -383,6 +383,29 @@
   .stat-value.green { color: var(--green); }
   .stat-value.red   { color: var(--red); }
 
+  /* ── Table Total Row ─────────────────── */
+  tfoot tr {
+    background: var(--surface-2);
+    border-top: 2px solid var(--border-2);
+  }
+
+  tfoot td {
+    font-weight: 600;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text);
+    padding: 7px 10px;
+    white-space: nowrap;
+  }
+
+  tfoot td.total-label {
+    color: var(--text-3);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+
   /* ── Reason Cards ────────────────────── */
   .reason-grid {
     display: grid;
@@ -704,6 +727,7 @@
             <tbody id="positions-body">
               <tr class="empty-row"><td colspan="13">Loading…</td></tr>
             </tbody>
+            <tfoot id="positions-foot"></tfoot>
           </table>
         </div>
       </div>
@@ -741,6 +765,7 @@
             <tbody id="history-body">
               <tr class="empty-row"><td colspan="19">Loading…</td></tr>
             </tbody>
+            <tfoot id="history-foot"></tfoot>
           </table>
         </div>
       </div>
@@ -812,7 +837,7 @@
             <option value="30" selected>Last 30 days</option>
             <option value="90">Last 90 days</option>
           </select>
-          <button class="btn btn-primary" onclick="loadRejects()">Refresh</button>
+          <button class="btn btn-primary" onclick="loadRejects(); loadSignalLog()">Refresh</button>
         </div>
       </div>
       <div class="stat-grid" id="rej-summary" style="grid-template-columns:repeat(3,1fr)">
@@ -869,8 +894,8 @@
           <span class="pill" id="siglog-count">—</span>
         </div>
       </div>
-      <div id="siglog-cards" class="reason-grid">
-        <div style="color:var(--text-3);font-size:13px;grid-column:1/-1">Select period above and click Load</div>
+      <div id="siglog-cards">
+        <div style="color:var(--text-3);font-size:13px">Select period above and click Load</div>
       </div>
     </div>
 
@@ -981,7 +1006,7 @@ function onTabLoad(name) {
   if (name === 'signals')   loadSignals();
   if (name === 'trades')    { loadOpenPositions(); loadTradeHistory(); }
   if (name === 'analytics') { loadAnalytics(); initAnalyticsCharts(); }
-  if (name === 'rejects')   loadRejects();
+  if (name === 'rejects')   { loadRejects(); loadSignalLog(); }
 }
 
 // ─── Overview Charts ───────────────────────────────────────────────────────────
@@ -1275,10 +1300,14 @@ async function loadOpenPositions() {
   document.getElementById("open-count-t").textContent = n;
   document.getElementById("open-pos").textContent = n;
 
+  const foot = document.getElementById("positions-foot");
+
   if (!n) {
     tbody.innerHTML = "<tr class='empty-row'><td colspan='13'>No open positions</td></tr>";
+    foot.innerHTML = "";
     return;
   }
+
   tbody.innerHTML = trades.map(t => {
     const opened = t.opened_at ? t.opened_at.substring(0, 16).replace("T", " ") : "—";
     return `<tr>
@@ -1297,6 +1326,18 @@ async function loadOpenPositions() {
       <td class="muted">${fmt(t.signal_adx, 1)}</td>
     </tr>`;
   }).join("");
+
+  // ── totals ──
+  const totalLots = trades.reduce((s, t) => s + parseFloat(t.lot_size || 0), 0);
+  const buys      = trades.filter(t => t.direction === "BUY").length;
+  const sells     = trades.filter(t => t.direction === "SELL").length;
+
+  foot.innerHTML = `<tr>
+    <td class="total-label" colspan="2">TOTAL  ${n} positions</td>
+    <td style="font-size:11px"><span class="pos">${buys}B</span> / <span class="neg">${sells}S</span></td>
+    <td>${fmt(totalLots, 2)}</td>
+    <td colspan="9"></td>
+  </tr>`;
 }
 
 // ─── Trade History ─────────────────────────────────────────────────────────────
@@ -1306,10 +1347,14 @@ async function loadTradeHistory() {
   const tbody  = document.getElementById("history-body");
   document.getElementById("hist-count").textContent = trades ? trades.length : 0;
 
+  const foot = document.getElementById("history-foot");
+
   if (!trades || !trades.length) {
     tbody.innerHTML = "<tr class='empty-row'><td colspan='19'>No trade history</td></tr>";
+    foot.innerHTML = "";
     return;
   }
+
   tbody.innerHTML = trades.map(t => {
     const pnl  = parseFloat(t.net_pnl);
     const r    = parseFloat(t.r_multiple);
@@ -1337,6 +1382,33 @@ async function loadTradeHistory() {
       <td class="muted">${fmt(t.signal_adx, 1)}</td>
     </tr>`;
   }).join("");
+
+  // ── totals ──
+  const totalGross = trades.reduce((s, t) => s + parseFloat(t.gross_pnl || 0), 0);
+  const totalNet   = trades.reduce((s, t) => s + parseFloat(t.net_pnl   || 0), 0);
+  const totalComm  = trades.reduce((s, t) => s + parseFloat(t.commission || 0), 0);
+  const totalSwap  = trades.reduce((s, t) => s + parseFloat(t.swap       || 0), 0);
+  const totalLots  = trades.reduce((s, t) => s + parseFloat(t.lots       || 0), 0);
+  const avgR       = trades.reduce((s, t) => s + parseFloat(t.r_multiple || 0), 0) / trades.length;
+  const wins       = trades.filter(t => parseFloat(t.net_pnl) > 0).length;
+  const losses     = trades.filter(t => parseFloat(t.net_pnl) < 0).length;
+  const netCls     = totalNet >= 0 ? "pos" : "neg";
+  const grossCls   = totalGross >= 0 ? "pos" : "neg";
+  const rCls       = avgR >= 0 ? "pos" : "neg";
+
+  foot.innerHTML = `<tr>
+    <td class="total-label" colspan="2">TOTAL  ${trades.length} trades</td>
+    <td style="font-size:11px"><span class="pos">${wins}W</span> / <span class="neg">${losses}L</span></td>
+    <td colspan="2"></td>
+    <td>${fmt(totalLots, 2)}</td>
+    <td class="${grossCls}">${fmtSign(totalGross)}</td>
+    <td class="${netCls}">${fmtSign(totalNet)}</td>
+    <td class="${rCls}">${avgR >= 0 ? "+" : ""}${fmt(avgR, 2)}R</td>
+    <td></td>
+    <td class="muted">${fmtSign(totalComm)}</td>
+    <td class="muted">${fmtSign(totalSwap)}</td>
+    <td colspan="7"></td>
+  </tr>`;
 }
 
 // ─── Analytics ─────────────────────────────────────────────────────────────────
@@ -1473,7 +1545,7 @@ async function loadSignalLog() {
   const wrap   = document.getElementById("siglog-cards");
   const pill   = document.getElementById("siglog-count");
 
-  wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px;grid-column:1/-1"><span class="spinner"></span> Loading…</div>`;
+  wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px"><span class="spinner"></span> Loading…</div>`;
   pill.textContent = "…";
 
   let url = `/analytics/signal-log?days=${days}&limit=200&type=${_reasonType}`;
@@ -1482,7 +1554,7 @@ async function loadSignalLog() {
   const rows = await get(url);
 
   if (!rows) {
-    wrap.innerHTML = `<div style="color:var(--red);font-size:13px;grid-column:1/-1">Failed to load data</div>`;
+    wrap.innerHTML = `<div style="color:var(--red);font-size:13px">Failed to load data</div>`;
     pill.textContent = "—";
     return;
   }
@@ -1490,42 +1562,81 @@ async function loadSignalLog() {
   pill.textContent = rows.length + (rows.length === 200 ? "+" : "");
 
   if (!rows.length) {
-    wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px;grid-column:1/-1">No signals in this period</div>`;
+    wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px">No signals in this period</div>`;
     return;
   }
 
-  wrap.innerHTML = rows.map(r => {
-    const isEntry  = r.direction === "BUY" || r.direction === "SELL";
-    const cardCls  = isEntry ? "entry" : "reject";
-    const dirCls   = r.direction === "BUY" ? "pos" : r.direction === "SELL" ? "neg" : "warn";
-    const ts       = r.timestamp ? r.timestamp.substring(0, 16).replace("T", " ") : "—";
-    const emaGap   = r.ema_gap != null ? (r.ema_gap >= 0 ? "+" : "") + r.ema_gap.toFixed(3) + "%" : "—";
-    const htfTxt   = r.htf_pass === true ? "aligned" : r.htf_pass === false ? "counter" : "none";
-    const htfCls   = r.htf_pass === true ? "pos" : r.htf_pass === false ? "neg" : "";
-    const rejectRow = !isEntry && r.reject_reason
-      ? `<div class="kv"><span class="k">reject</span><span class="v"><span class="reject-tag">${r.reject_reason}</span></span></div>`
-      : "";
+  // ── compact list table ──────────────────────────────────────────
+  const tableHtml = `
+    <div class="table-card" style="margin-bottom:16px">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th><th>Symbol</th><th>Dir</th><th>Score</th>
+              <th>Price</th><th>RSI</th><th>ADX</th><th>Session</th><th>Reject</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(r => {
+              const ts  = r.timestamp ? r.timestamp.substring(0,16).replace("T"," ") : "—";
+              const dirC = r.direction === "BUY" ? "pos" : r.direction === "SELL" ? "neg" : "warn";
+              const rej  = r.reject_reason
+                ? `<span style="font-family:monospace;color:var(--yellow);font-size:11px">${r.reject_reason}</span>`
+                : `<span class="muted">—</span>`;
+              return `<tr>
+                <td class="muted" style="font-size:11px">${ts}</td>
+                <td class="sym">${r.symbol}</td>
+                <td class="${dirC}">${r.direction}</td>
+                <td>${r.score != null ? r.score+"/7" : "—"}</td>
+                <td class="muted">${fmt(r.price,5)}</td>
+                <td class="${rsiColor(r.rsi)}">${fmt(r.rsi,1)}</td>
+                <td class="muted">${fmt(r.adx,1)}</td>
+                <td class="muted">${r.session || "—"}</td>
+                <td>${rej}</td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+
+  // ── detail cards ────────────────────────────────────────────────
+  const cardsHtml = rows.map(r => {
+    const isEntry = r.direction === "BUY" || r.direction === "SELL";
+    const cardCls = isEntry ? "entry" : "reject";
+    const dirCls  = r.direction === "BUY" ? "pos" : r.direction === "SELL" ? "neg" : "warn";
+    const ts      = r.timestamp ? r.timestamp.substring(0,16).replace("T"," ") : "—";
+    const emaGap  = r.ema_gap != null ? (r.ema_gap >= 0 ? "+" : "") + r.ema_gap.toFixed(3) + "%" : "—";
+    const emaGapCls = r.ema_gap != null && r.ema_gap >= 0 ? "pos" : "neg";
+    const htfTxt  = r.htf_pass === true ? "aligned" : r.htf_pass === false ? "counter" : "—";
+    const htfCls  = r.htf_pass === true ? "pos" : r.htf_pass === false ? "neg" : "";
+    const rejectVal = r.reject_reason
+      ? `<span class="reject-tag">${r.reject_reason}</span>`
+      : `<span class="muted">—</span>`;
 
     return `<div class="reason-card ${cardCls}">
       <div class="reason-card-header">
         <span class="reason-card-title">${r.symbol} <span class="${dirCls}">${r.direction}</span></span>
         <span style="color:var(--text-3);font-size:11px">${ts}</span>
       </div>
-      <div class="kv"><span class="k">price</span><span class="v">${fmt(r.price, 5)}</span></div>
-      <div class="kv"><span class="k">ema50</span><span class="v">${fmt(r.ema50, 5)}</span></div>
-      <div class="kv"><span class="k">ema200</span><span class="v">${fmt(r.ema200, 5)}</span></div>
-      <div class="kv"><span class="k">ema_gap</span><span class="v ${r.ema_gap != null && r.ema_gap >= 0 ? 'pos' : 'neg'}">${emaGap}</span></div>
-      <div class="kv"><span class="k">rsi</span><span class="v ${rsiColor(r.rsi)}">${fmt(r.rsi, 1)}</span></div>
-      <div class="kv"><span class="k">adx</span><span class="v">${fmt(r.adx, 1)}</span></div>
-      <div class="kv"><span class="k">di+</span><span class="v pos">${fmt(r.di_plus, 1)}</span></div>
-      <div class="kv"><span class="k">di-</span><span class="v neg">${fmt(r.di_minus, 1)}</span></div>
-      <div class="kv"><span class="k">atr</span><span class="v">${fmt(r.atr, 5)}</span></div>
-      <div class="kv"><span class="k">htf</span><span class="v ${htfCls}">${htfTxt}</span></div>
-      <div class="kv"><span class="k">score</span><span class="v">${r.score != null ? r.score + "/7" : "—"}</span></div>
-      ${rejectRow}
-      <div class="kv"><span class="k">session</span><span class="v">${r.session || "—"}</span></div>
+      <div class="kv"><span class="k">price</span>   <span class="v">${fmt(r.price,  5)}</span></div>
+      <div class="kv"><span class="k">ema50</span>   <span class="v">${fmt(r.ema50,  5)}</span></div>
+      <div class="kv"><span class="k">ema200</span>  <span class="v">${fmt(r.ema200, 5)}</span></div>
+      <div class="kv"><span class="k">ema_gap</span> <span class="v ${emaGapCls}">${emaGap}</span></div>
+      <div class="kv"><span class="k">rsi</span>     <span class="v ${rsiColor(r.rsi)}">${fmt(r.rsi, 1)}</span></div>
+      <div class="kv"><span class="k">adx</span>     <span class="v">${fmt(r.adx, 1)}</span></div>
+      <div class="kv"><span class="k">di+</span>     <span class="v pos">${fmt(r.di_plus,  1)}</span></div>
+      <div class="kv"><span class="k">di-</span>     <span class="v neg">${fmt(r.di_minus, 1)}</span></div>
+      <div class="kv"><span class="k">atr</span>     <span class="v">${fmt(r.atr, 5)}</span></div>
+      <div class="kv"><span class="k">htf</span>     <span class="v ${htfCls}">${htfTxt}</span></div>
+      <div class="kv"><span class="k">score</span>   <span class="v">${r.score != null ? r.score+"/7" : "—"}</span></div>
+      <div class="kv"><span class="k">reject</span>  <span class="v">${rejectVal}</span></div>
+      <div class="kv"><span class="k">session</span> <span class="v">${r.session || "—"}</span></div>
     </div>`;
   }).join("");
+
+  wrap.innerHTML = tableHtml + `<div class="reason-grid">${cardsHtml}</div>`;
 }
 
 // ─── Init ──────────────────────────────────────────────────────────────────────

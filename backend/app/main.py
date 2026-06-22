@@ -7,7 +7,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 
 from .database import init_db
-from .routers import data, signals, trades, analytics
+from .routers import data, signals, trades, analytics, risk
 from .config import get_settings
 
 logging.basicConfig(
@@ -46,6 +46,7 @@ app.include_router(data.router)
 app.include_router(signals.router)
 app.include_router(trades.router)
 app.include_router(analytics.router)
+app.include_router(risk.router)
 
 
 @app.get("/health")
