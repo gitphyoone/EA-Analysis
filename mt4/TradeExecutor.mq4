@@ -1,27 +1,26 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT4 Trade Executor v2.07                     |
+//| V19 FX Prop Desk — MT4 Trade Executor v2.09                     |
 //| FIXES APPLIED:                                                   |
-//|  1-16. (see v2.06 header)                                        |
+//|  1-19. (see v2.08 header)                                        |
 //| ──────────────────────────────────────────────────────────────── |
-//| v2.07 CRITICAL FIX:                                             |
-//| 17. Duplicate symbol entry fix (v2.06)                          |
-//| 18. FIX: Partial close loop bug                                 |
-//|     Root cause: MarkPartialClosed() stored in RAM array —       |
-//|     array resets on EA reinit/reattach, so same ticket could    |
-//|     be partially closed many times across restarts.             |
-//|     Also: r >= 2.0 check ran every tick even after partial,     |
-//|     causing 0.72→0.36→0.18→0.09→... cascade.                   |
-//|     Fix A: GlobalVariable "PC_{ticket}" — persists across       |
-//|             EA restart, MT4 restart, until explicitly deleted.  |
-//|     Fix B: min lot guard — skip partial if OrderLots() <= 0.02  |
-//|     Fix C: after partial close, move SL to entry−20% profit     |
-//|             so worst case = locked profit, not 0                |
-//|     Fix D: Partial_Close_At_R input (default 2.0) — user can   |
-//|             change trigger without recompile                    |
-//|     Fix E: Partial_Close_Ratio input (default 0.5 = 50%)       |
+//| v2.09 NEW: Step-trail exit logic                                |
+//|  20. TP = entry ± sl_dist × 2.0  (2R minimum target)           |
+//|  21. Partial close 30% at +2R (was 50%)                        |
+//|  22. SL 0.5R step-trail after partial close:                   |
+//|        r=2.0 → SL = entry+1.0R                                 |
+//|        r=2.5 → SL = entry+1.5R                                 |
+//|        r=3.0 → SL = entry+2.0R                                 |
+//|        r=3.5 → SL = entry+2.5R  (continues indefinitely)      |
+//|      Formula: r_step=floor(r×2)/2 → SL=entry+(r_step-1)×R     |
+//|      Tighter than integer(1R step), less noisy than continuous  |
+//|      ATR trailing removed — step-trail replaces it              |
+//|  Design intent:                                                 |
+//|    Trend小 → TP(2R) hit → clean exit                           |
+//|    Trend大 → SL trails every 0.5R, TP extends, profit grows    |
+//|    Worst case after +2R partial → locked at +1R minimum         |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "2.08"
+#property version   "2.09"
 #property strict
 
 #include <stdlib.mqh>
@@ -47,9 +46,12 @@ input double Risk_Per_Trade_Pct     = 1.0;
 input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
-// ── FIX 18D/E: Partial close inputs ─────────────────────────────────
-input double Partial_Close_At_R     = 2.0;   // trigger at +N × R
-input double Partial_Close_Ratio    = 0.5;   // fraction to close (0.5 = 50%)
+// ── Exit logic inputs ────────────────────────────────────────────────
+input double TP_R_Multiple          = 2.0;   // TP = entry ± SL_dist × 2.0
+input double Partial_Close_At_R     = 2.0;   // partial close trigger
+input double Partial_Close_Ratio    = 0.30;  // 30% close at +2R
+// Step-trail: after +2R, SL moves to entry+(N-1)×R at each +NR level
+// No ATR trailing — step-trail replaces it
 
 // ── Circuit breaker ──────────────────────────────────────────────────
 input double CB_Level1_DD_Pct       = 3.0;
@@ -88,20 +90,24 @@ void ClearOpenedSymbol(string sym) {
     }
 }
 
-// ── FIX 18A: GlobalVariable-based partial close tracking ─────────────
-// "PC_{ticket}" persists across EA reinit / MT4 restart
-// Unlike RAM arrays which reset on reattach
-string GV_PC(int ticket) { return "PC_" + IntegerToString(ticket); }
-
-bool IsPartialClosed(int ticket) {
-    return GlobalVariableCheck(GV_PC(ticket));
+// ── FIX 19: Symbol+Magic partial close tracking ──────────────────────
+// Key: "PC_{symbol}_{magic}" — ticket-agnostic, EA-isolated
+string GV_PC(string sym) {
+    return "PC_" + sym + "_" + IntegerToString(Magic_Number);
 }
-void MarkPartialClosed(int ticket) {
-    GlobalVariableSet(GV_PC(ticket), (double)TimeCurrent());
+bool IsSymbolPartialClosed(string sym) {
+    return GlobalVariableCheck(GV_PC(sym));
 }
-void CleanupPartialGV(int ticket) {
-    // Call when trade fully closed — removes stale GV
-    string gv = GV_PC(ticket);
+void MarkSymbolPartialClosed(string sym) {
+    GlobalVariableSet(GV_PC(sym), (double)TimeCurrent());
+}
+void ClearSymbolPartialClosed(string sym) {
+    string gv = GV_PC(sym);
+    if (GlobalVariableCheck(gv)) GlobalVariableDel(gv);
+}
+// Legacy cleanup for v2.07 PC_{ticket} GVs
+void CleanupLegacyGV(int ticket) {
+    string gv = "PC_" + IntegerToString(ticket);
     if (GlobalVariableCheck(gv)) GlobalVariableDel(gv);
 }
 
@@ -210,16 +216,19 @@ int OnInit() {
     int n = StringSplit(raw, ',', tmp);
     ArrayResize(symbols, n);
     for (int i = 0; i < n; i++) symbols[i] = tmp[i];
-    num_symbols   = n;
+    num_symbols    = n;
     g_opened_count = 0;
     for (int j = 0; j < ArraySize(g_opened_symbols); j++) g_opened_symbols[j] = "";
     EventSetTimer(Poll_Seconds);
-    Print("[Executor v2.07] Initialized"
+    Print("[Executor v2.09] Initialized"
           " | symbols=", Symbol_List,
+          " | magic=", Magic_Number,
           " | max_pos=", Max_Open_Positions,
           " | portfolio=", Portfolio_Max_Risk_Pct, "%"
-          " | risk/trade=", Risk_Per_Trade_Pct, "%"
-          " | partial_at=+", Partial_Close_At_R, "R x", Partial_Close_Ratio);
+          " | risk=", Risk_Per_Trade_Pct, "%"
+          " | TP=", TP_R_Multiple, "R"
+          " | partial=", Partial_Close_Ratio*100, "% @+", Partial_Close_At_R, "R"
+          " | step-trail per R after partial");
     return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason) { EventKillTimer(); }
@@ -286,27 +295,18 @@ void EvaluateSignals() {
     for (int i = 0; i < num_symbols; i++) {
         string sym = symbols[i];
 
-        // FIX 17A: HasOpenPosition first
         if (HasOpenPosition(sym)) continue;
-
-        // FIX 17B: broker-delay guard
         if (IsOpenedSymbol(sym)) {
             if (!HasOpenPosition(sym)) ClearOpenedSymbol(sym);
             else continue;
         }
-
-        // FIX 14: position count cap
         if (GetOpenCount() >= Max_Open_Positions) {
-            if (Debug) Print("[Executor] Max pos (", Max_Open_Positions, ") — stop");
+            if (Debug) Print("[Executor] Max pos (",Max_Open_Positions,") — stop");
             break;
         }
-
-        // FIX 15: portfolio exposure cap
         double cur_risk = GetTotalOpenRiskPct();
         if (cur_risk + Risk_Per_Trade_Pct > Portfolio_Max_Risk_Pct) {
-            if (Debug) Print("[Executor] Portfolio cap (",
-                             DoubleToStr(cur_risk,2),"% + ",Risk_Per_Trade_Pct,
-                             "% > ",Portfolio_Max_Risk_Pct,"%) — stop");
+            if (Debug) Print("[Executor] Portfolio cap — stop");
             break;
         }
 
@@ -352,7 +352,8 @@ string FetchSignal(string sym,
     e50  = JsonDouble(body,"ema50");
     e200 = JsonDouble(body,"ema200");
     rej  = JsonString(body,"reject_reason");
-    if (Debug) Print("[Executor] Signal ",sym," → ",dir," score=",sc," reject=",rej);
+    if (Debug) Print("[Executor] Signal ",sym," → ",dir,
+                     " score=",sc," reject=",rej);
     return dir;
 }
 
@@ -381,9 +382,14 @@ void OpenTrade(string sym, string dir,
     if (dir=="BUY") { price=MarketInfo(sym,MODE_ASK); cmd=OP_BUY; }
     else            { price=MarketInfo(sym,MODE_BID); cmd=OP_SELL; }
 
-    double sl_dist = atr*1.5, tp_dist = atr*3.0;
-    double sl = (cmd==OP_BUY) ? price-sl_dist : price+sl_dist;
-    double tp = (cmd==OP_BUY) ? price+tp_dist : price-tp_dist;
+    double sl_dist = atr * 1.5;
+
+    // v2.09: TP = entry ± sl_dist × TP_R_Multiple (2R)
+    // Trend small → TP(2R) hit → clean exit
+    // Trend large → trail SL follows, TP may be extended via OrderModify
+    double sl = (cmd==OP_BUY) ? price - sl_dist : price + sl_dist;
+    double tp = (cmd==OP_BUY) ? price + sl_dist * TP_R_Multiple
+                              : price - sl_dist * TP_R_Multiple;
 
     double equity   = AccountEquity();
     double risk_amt = equity * (Risk_Per_Trade_Pct/100.0);
@@ -404,12 +410,14 @@ void OpenTrade(string sym, string dir,
         Print("[Executor] OrderSend failed ",sym," err=",GetLastError()); return;
     }
 
-    MarkOpenedSymbol(sym);  // FIX 17B
+    MarkOpenedSymbol(sym);
     string msg = StringFormat(
-        "[Trade OPEN] %s %s | lots=%.2f price=%.5f SL=%.5f TP=%.5f risk=%.1f%% ticket=%d",
-        dir,sym,lots,price,sl,tp,Risk_Per_Trade_Pct,ticket);
+        "[Trade OPEN] %s %s | lots=%.2f price=%.5f SL=%.5f TP=%.5f"
+        " (%.1fR) risk=%.1f%% ticket=%d",
+        dir,sym,lots,price,sl,tp,TP_R_Multiple,Risk_Per_Trade_Pct,ticket);
     if (Debug) Print(msg); SendTelegram(msg);
-    NotifyBackend(ticket,sym,dir,price,sl,tp,lots,equity,risk_amt,atr,sc,rsi,adx,dip,dim,e50,e200);
+    NotifyBackend(ticket,sym,dir,price,sl,tp,lots,
+                  equity,risk_amt,atr,sc,rsi,adx,dip,dim,e50,e200);
 }
 
 // ── Manage Open Positions ────────────────────────────────────────────
@@ -424,79 +432,100 @@ void ManageOpenTrades() {
                                               : MarketInfo(sym,MODE_ASK);
         double entry   = OrderOpenPrice();
         double sl      = OrderStopLoss();
-        double sl_dist = MathAbs(entry-sl);
+        double sl_dist = MathAbs(entry - sl);
         if (sl_dist == 0) continue;
 
-        double atr     = iATR(sym,60,14,0);
-        double r       = (OrderType()==OP_BUY) ? (cur-entry)/sl_dist
-                                               : (entry-cur)/sl_dist;
-        double ps      = (StringFind(sym,"JPY")>=0) ? 0.01 : 0.0001;
-        double be_sl   = (OrderType()==OP_BUY) ? entry+ps*BE_Buffer_Pips
-                                               : entry-ps*BE_Buffer_Pips;
+        // r = current profit in units of initial risk (SL distance)
+        double r  = (OrderType()==OP_BUY) ? (cur - entry) / sl_dist
+                                          : (entry - cur) / sl_dist;
+        double ps = (StringFind(sym,"JPY")>=0) ? 0.01 : 0.0001;
 
         // ── Break-even at +1R ───────────────────────────────────────
-        bool be_set = (OrderType()==OP_BUY) ? (sl >= be_sl-ps*0.1)
-                                            : (sl <= be_sl+ps*0.1);
+        double be_sl = (OrderType()==OP_BUY) ? entry + ps*BE_Buffer_Pips
+                                             : entry - ps*BE_Buffer_Pips;
+        bool be_set  = (OrderType()==OP_BUY) ? (sl >= be_sl - ps*0.1)
+                                             : (sl <= be_sl + ps*0.1);
         if (r >= 1.0 && !be_set)
             if (OrderModify(ticket,entry,be_sl,OrderTakeProfit(),0,clrYellow))
                 if (Debug) Print("[Mgr] BE moved ticket=",ticket);
 
-        // ── FIX 18: Partial close — once only via GlobalVariable ────
-        if (r >= Partial_Close_At_R && !IsPartialClosed(ticket)) {
-            // FIX 18B: skip if position already too small
+        // ── v2.09: 30% partial close at +2R ────────────────────────
+        if (r >= Partial_Close_At_R && !IsSymbolPartialClosed(sym)) {
             if (OrderLots() <= 0.02) {
-                MarkPartialClosed(ticket);  // prevent future attempts
-                if (Debug) Print("[Mgr] Lot too small for partial — skip ticket=",ticket);
+                MarkSymbolPartialClosed(sym);
+                if (Debug) Print("[Mgr] Lot too small, skip partial — ",sym);
             } else {
                 double close_lot = NormalizeDouble(OrderLots()*Partial_Close_Ratio, 2);
                 close_lot = MathMax(close_lot, MarketInfo(sym,MODE_MINLOT));
 
-                // FIX 18A: mark BEFORE close attempt — prevents repeat on broker error
-                MarkPartialClosed(ticket);
+                MarkSymbolPartialClosed(sym);  // mark before attempt
 
                 bool ok = OrderClose(ticket, close_lot, cur, Slippage, clrOrange);
                 if (ok) {
+                    // SL → entry + 1R (lock 1R profit after partial)
+                    double sl_1r = (OrderType()==OP_BUY) ? entry + sl_dist
+                                                         : entry - sl_dist;
+                    bool sl_ok = (OrderType()==OP_BUY) ? (sl_1r > sl)
+                                                       : (sl_1r < sl || sl==0);
+                    if (sl_ok)
+                        if (OrderModify(ticket,entry,sl_1r,OrderTakeProfit(),0,clrGreen))
+                            if (Debug) Print("[Mgr] Partial 30% + SL→+1R ticket=",ticket,
+                                             " sl_1r=",DoubleToStr(sl_1r,5));
                     string msg = StringFormat(
-                        "[Trade PARTIAL] ticket=%d %s %.0f%% @ %.5f",
-                        ticket, sym, Partial_Close_Ratio*100, cur);
+                        "[Trade PARTIAL] ticket=%d %s 30%% @ %.5f | SL→+1R",
+                        ticket, sym, cur);
                     if (Debug) Print(msg); SendTelegram(msg);
-
-                    // FIX 18C: move SL to lock 80% of profit after partial close
-                    // new_sl = entry + (cur-entry)*0.8  (lock 80% of profit distance)
-                    double profit_dist = MathAbs(cur - entry);
-                    double lock_dist   = profit_dist * 0.80;
-                    double new_sl;
-                    if (OrderType()==OP_BUY)
-                        new_sl = entry + lock_dist;
-                    else
-                        new_sl = entry - lock_dist;
-
-                    // Ensure new_sl is better than current sl
-                    bool sl_ok = (OrderType()==OP_BUY) ? (new_sl > sl) : (new_sl < sl || sl==0);
-                    if (sl_ok) {
-                        if (OrderModify(ticket, entry, new_sl, OrderTakeProfit(), 0, clrGreen))
-                            if (Debug) Print("[Mgr] SL locked at 80% profit ticket=",ticket,
-                                             " new_sl=",DoubleToStr(new_sl,5));
-                    }
                 } else {
-                    Print("[Mgr] Partial close failed ticket=",ticket," err=",GetLastError());
-                    // Note: already marked — will NOT retry (intentional)
+                    Print("[Mgr] Partial failed ",sym," ticket=",ticket,
+                          " err=",GetLastError());
                 }
             }
         }
 
-        // ── Trailing stop (only after partial close, ATR×1.5) ───────
-        if (r >= Partial_Close_At_R && IsPartialClosed(ticket) && atr > 0) {
-            double trail  = atr*1.5;
-            double new_sl = (OrderType()==OP_BUY) ? cur-trail : cur+trail;
-            if (OrderType()==OP_BUY && new_sl > sl)
-                if (!OrderModify(ticket,entry,new_sl,OrderTakeProfit(),0,clrGreen) && Debug)
+        // ── v2.09: Step-trail SL at each R level ────────────────────
+        // After partial close, move SL to entry+(N-1)×sl_dist at each +NR
+        // e.g. +3R → SL=entry+2R, +4R → SL=entry+3R, +5R → SL=entry+4R
+        //
+        // Only runs after partial close (IsSymbolPartialClosed=true)
+        // Uses integer R levels to avoid SL oscillation on noise
+        if (IsSymbolPartialClosed(sym) && r >= Partial_Close_At_R) {
+            // 0.5R step trail — tighter than integer, less noise-sensitive than continuous
+            // r_step = floor(r × 2) / 2  → 2.0→2.0, 2.4→2.0, 2.5→2.5, 2.9→2.5, 3.0→3.0
+            double r_step = MathFloor(r * 2.0) / 2.0;
+            if (r_step < Partial_Close_At_R) r_step = Partial_Close_At_R;
 
-                    Print("[OrderModify] failed ticket=",ticket," err=",GetLastError());
-            else if (OrderType()!=OP_BUY && (new_sl < sl || sl==0))
-                if (!OrderModify(ticket,entry,new_sl,OrderTakeProfit(),0,clrGreen) && Debug)
+            // Target SL = entry + (r_step - 1.0) × sl_dist
+            // e.g. r=2.5 → r_step=2.5 → SL = entry + 1.5R
+            //      r=2.9 → r_step=2.5 → SL = entry + 1.5R
+            //      r=3.0 → r_step=3.0 → SL = entry + 2.0R
+            double target_sl = (OrderType()==OP_BUY)
+                                ? entry + (r_step - 1.0) * sl_dist
+                                : entry - (r_step - 1.0) * sl_dist;
 
-                    Print("[OrderModify] failed ticket=",ticket," err=",GetLastError());
+            // Only move SL forward (never backward)
+            bool should_move = (OrderType()==OP_BUY) ? (target_sl > sl)
+                                                      : (target_sl < sl || sl==0);
+            if (should_move) {
+                if (OrderModify(ticket,entry,target_sl,OrderTakeProfit(),0,clrGreen))
+                    if (Debug) Print("[Mgr] 0.5R step-trail ticket=",ticket,
+                                     " r=",    DoubleToStr(r,2),
+                                     " step=", DoubleToStr(r_step,1),
+                                     " → SL=", DoubleToStr(target_sl,5));
+            }
+
+            // Extend TP if price has surpassed it (trend continuation)
+            // TP moves to entry + (r_step + 0.5) × sl_dist
+            double cur_tp  = OrderTakeProfit();
+            double new_tp  = (OrderType()==OP_BUY)
+                             ? entry + (r_step + 0.5) * sl_dist
+                             : entry - (r_step + 0.5) * sl_dist;
+            bool tp_behind = (OrderType()==OP_BUY) ? (cur >= cur_tp - ps)
+                                                    : (cur <= cur_tp + ps);
+            if (tp_behind && MathAbs(new_tp - cur_tp) > ps) {
+                if (OrderModify(ticket,entry,target_sl,new_tp,0,clrBlue))
+                    if (Debug) Print("[Mgr] TP extended ticket=",ticket,
+                                     " new_tp=",DoubleToStr(new_tp,5));
+            }
         }
     }
 }
@@ -508,39 +537,31 @@ void Level2ProtectTrades() {
         if (OrderMagicNumber() != Magic_Number) continue;
         string sym    = OrderSymbol();
         int    ticket = OrderTicket();
-        double cur    = (OrderType()==OP_BUY)?MarketInfo(sym,MODE_BID):MarketInfo(sym,MODE_ASK);
+        double cur    = (OrderType()==OP_BUY)?MarketInfo(sym,MODE_BID)
+                                             :MarketInfo(sym,MODE_ASK);
         double pnl    = OrderProfit()+OrderSwap()+OrderCommission();
         if (pnl < 0) {
             if (OrderClose(ticket,OrderLots(),cur,Slippage,clrRed)) {
-                string msg=StringFormat("[CB-L2] Closed loser ticket=%d %s pnl=%.2f",ticket,sym,pnl);
+                string msg=StringFormat("[CB-L2] Closed loser ticket=%d %s pnl=%.2f",
+                                        ticket,sym,pnl);
                 Print(msg); SendTelegram(msg);
             }
             continue;
         }
+        // Protect winner: move SL to BE immediately
         double entry  = OrderOpenPrice();
         double sl     = OrderStopLoss();
         double ps     = (StringFind(sym,"JPY")>=0)?0.01:0.0001;
-        double be_sl  = (OrderType()==OP_BUY)?entry+ps*BE_Buffer_Pips:entry-ps*BE_Buffer_Pips;
+        double be_sl  = (OrderType()==OP_BUY)?entry+ps*BE_Buffer_Pips
+                                             :entry-ps*BE_Buffer_Pips;
         bool be_set   = (OrderType()==OP_BUY)?(sl>=be_sl-ps*0.1):(sl<=be_sl+ps*0.1);
         if (!be_set)
             if (OrderModify(ticket,entry,be_sl,OrderTakeProfit(),0,clrOrange))
                 if (Debug) Print("[CB-L2] BE set ticket=",ticket);
-        double atr = iATR(sym,60,14,0);
-        if (atr > 0) {
-            double new_sl=(OrderType()==OP_BUY)?cur-atr:cur+atr;
-            if (OrderType()==OP_BUY && new_sl>sl)
-                if (!OrderModify(ticket,entry,new_sl,OrderTakeProfit(),0,clrGreen) && Debug)
-
-                    Print("[OrderModify] failed ticket=",ticket," err=",GetLastError());
-            else if (OrderType()!=OP_BUY && (new_sl<sl||sl==0))
-                if (!OrderModify(ticket,entry,new_sl,OrderTakeProfit(),0,clrGreen) && Debug)
-
-                    Print("[OrderModify] failed ticket=",ticket," err=",GetLastError());
-        }
     }
 }
 
-// ── Detect and report closed trades ─────────────────────────────────
+// ── Detect and report closed trades ──────────────────────────────────
 string FormatISO8601(datetime dt) {
     string s=TimeToString(dt,TIME_DATE|TIME_SECONDS);
     StringReplace(s,".","_"); StringReplace(s,"_","-");
@@ -549,7 +570,8 @@ string FormatISO8601(datetime dt) {
 }
 
 bool IsReportedClosed(int ticket) {
-    for (int i=0;i<n_reported_closed;i++) if(reported_closed_tickets[i]==ticket) return true;
+    for (int i=0;i<n_reported_closed;i++)
+        if(reported_closed_tickets[i]==ticket) return true;
     return false;
 }
 void MarkReportedClosed(int ticket) {
@@ -565,14 +587,19 @@ void DetectAndReportClosedTrades() {
         if (IsReportedClosed(ticket)) continue;
         datetime close_time = OrderCloseTime();
         if (close_time==0) continue;
-        if (TimeCurrent()-close_time > 604800) { MarkReportedClosed(ticket); continue; }
+        if (TimeCurrent()-close_time > 604800) {
+            MarkReportedClosed(ticket); continue;
+        }
 
-        // FIX 17B + 18A: cleanup on close
-        ClearOpenedSymbol(OrderSymbol());
-        CleanupPartialGV(ticket);
+        string sym = OrderSymbol();
+        if (!HasOpenPosition(sym)) {
+            ClearSymbolPartialClosed(sym);
+            ClearOpenedSymbol(sym);
+        }
+        CleanupLegacyGV(ticket);
 
         double cp=OrderClosePrice(), tp=OrderTakeProfit(), sl=OrderStopLoss();
-        double ps=(StringFind(OrderSymbol(),"JPY")>=0)?0.01:0.0001;
+        double ps=(StringFind(sym,"JPY")>=0)?0.01:0.0001;
         string reason="MANUAL";
         if (tp>0 && MathAbs(cp-tp)<=ps*3) reason="TP";
         else if (sl>0 && MathAbs(cp-sl)<=ps*3) reason="SL";
@@ -580,7 +607,8 @@ void DetectAndReportClosedTrades() {
         string body=StringFormat(
             "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,"
             "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
-            cp,OrderCommission(),OrderSwap(),reason,FormatISO8601(close_time),AccountEquity());
+            cp,OrderCommission(),OrderSwap(),
+            reason,FormatISO8601(close_time),AccountEquity());
 
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
@@ -588,9 +616,11 @@ void DetectAndReportClosedTrades() {
         int res=WebRequest("POST",url,POSTHeaders(),5000,post,result,rh);
         if (res==200||res==404) {
             MarkReportedClosed(ticket);
-            if (Debug) Print("[Executor] Close reported ticket=",ticket," reason=",reason," HTTP=",res);
+            if (Debug) Print("[Executor] Close reported ticket=",ticket,
+                             " reason=",reason," HTTP=",res);
         } else {
-            if (Debug) Print("[Executor] Close report failed ticket=",ticket," HTTP=",res);
+            if (Debug) Print("[Executor] Close report failed ticket=",ticket,
+                             " HTTP=",res);
         }
     }
 }
@@ -603,24 +633,25 @@ void CloseAllPositions(string reason) {
         string sym=OrderSymbol(); int ticket=OrderTicket();
         double entry=OrderOpenPrice();
         double profit=OrderProfit()+OrderSwap()+OrderCommission();
-        double cur=(OrderType()==OP_BUY)?MarketInfo(sym,MODE_BID):MarketInfo(sym,MODE_ASK);
+        double cur=(OrderType()==OP_BUY)?MarketInfo(sym,MODE_BID)
+                                        :MarketInfo(sym,MODE_ASK);
         if (profit < 0) {
-            bool closed = OrderClose(ticket,OrderLots(),cur,Slippage,clrRed);
-            if (closed) {
-                string msg=StringFormat("[Trade CLOSE] ticket=%d %s reason=%s (loss=%.2f)",ticket,sym,reason,profit);
+            bool ok=OrderClose(ticket,OrderLots(),cur,Slippage,clrRed);
+            if (ok) {
+                string msg=StringFormat(
+                    "[Trade CLOSE] ticket=%d %s reason=%s (loss=%.2f)",
+                    ticket,sym,reason,profit);
                 if(Debug)Print(msg); SendTelegram(msg);
-            } else if (Debug) {
+            } else if (Debug)
                 Print("[Trade CLOSE] failed ticket=",ticket," err=",GetLastError());
-            }
         } else {
-            double atr=iATR(sym,60,14,0);
-            double dist=MathAbs(cur-entry);
-            double buf=MathMax(dist*0.20,atr*0.3);
-            buf=MathMin(buf,atr*2.0);
-            double new_sl=(OrderType()==OP_BUY)?cur-buf:cur+buf;
+            double sl_dist = MathAbs(entry - OrderStopLoss());
+            double buf     = sl_dist * 0.20;
+            double new_sl  = (OrderType()==OP_BUY)?cur-buf:cur+buf;
             if (OrderModify(ticket,entry,new_sl,OrderTakeProfit(),0,clrYellow)) {
-                double pct=dist>0?(dist-buf)/dist*100:0;
-                string msg=StringFormat("[Trade LOCK] ticket=%d %s SL=%.5f (~%.0f%% locked) reason=%s",ticket,sym,new_sl,pct,reason);
+                string msg=StringFormat(
+                    "[Trade LOCK] ticket=%d %s SL=%.5f reason=%s",
+                    ticket,sym,new_sl,reason);
                 if(Debug)Print(msg); SendTelegram(msg);
             }
         }
@@ -631,7 +662,8 @@ void CloseAllPositions(string reason) {
 void NotifyBackend(int ticket,string sym,string dir,
                    double price,double sl,double tp,
                    double lots,double equity,double risk_amt,double atr,
-                   int sc,double rsi,double adx,double dip,double dim,double e50,double e200) {
+                   int sc,double rsi,double adx,double dip,double dim,
+                   double e50,double e200) {
     string body=StringFormat(
         "{\"ticket\":%d,\"symbol\":\"%s\",\"direction\":\"%s\","
         "\"entry_price\":%.6f,\"stop_loss\":%.6f,\"take_profit\":%.6f,"
