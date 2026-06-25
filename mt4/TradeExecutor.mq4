@@ -493,8 +493,9 @@ void DetectAndReportClosedTrades() {
         else if (sl>0&&MathAbs(cp-sl)<=ps*3) reason="SL";
         string body=StringFormat(
             "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,"
+            "\"profit\":%.2f,"
             "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
-            cp,OrderCommission(),OrderSwap(),reason,FormatISO8601(close_time),AccountEquity());
+            cp,OrderCommission(),OrderSwap(),OrderProfit(),reason,FormatISO8601(close_time),AccountEquity());
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
         StringToCharArray(body,post,0,StringLen(body));

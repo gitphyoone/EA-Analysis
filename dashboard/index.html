@@ -355,6 +355,20 @@
   .check { color: var(--green); }
   .cross { color: var(--red); }
 
+  /* ── Profit Target Cards ─────────────── */
+  .profit-hit  { border-left: 3px solid var(--green); }
+  .profit-prog { border-left: 3px solid var(--accent); }
+  .profit-none { border-left: 3px solid var(--border-2); }
+
+  .tp-bar-wrap {
+    height: 4px; background: var(--border);
+    border-radius: 2px; margin-top: 10px; overflow: hidden;
+  }
+  .tp-bar {
+    height: 100%; border-radius: 2px; width: 0%;
+    transition: width .5s ease; background: var(--accent);
+  }
+
   .score-bar {
     display: inline-flex; gap: 3px; align-items: center;
   }
@@ -581,6 +595,30 @@
         <div class="card" id="card-monthly-dd">
           <div class="card-label">Monthly DD</div>
           <div class="card-value" id="monthly-dd">—</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="section-label"><span>Profit Targets</span></div>
+      <div class="metrics-grid">
+        <div class="card profit-none" id="card-daily-tp">
+          <div class="card-label">Daily Profit</div>
+          <div class="card-value" id="daily-profit">—</div>
+          <div class="card-sub" id="daily-tp-sub">Target: $500</div>
+          <div class="tp-bar-wrap"><div class="tp-bar" id="daily-tp-bar"></div></div>
+        </div>
+        <div class="card profit-none" id="card-weekly-tp">
+          <div class="card-label">Weekly Profit</div>
+          <div class="card-value" id="weekly-profit">—</div>
+          <div class="card-sub" id="weekly-tp-sub">Target: $1,500</div>
+          <div class="tp-bar-wrap"><div class="tp-bar" id="weekly-tp-bar"></div></div>
+        </div>
+        <div class="card profit-none" id="card-monthly-tp">
+          <div class="card-label">Monthly Profit</div>
+          <div class="card-value" id="monthly-profit">—</div>
+          <div class="card-sub" id="monthly-tp-sub">Target: $5,000</div>
+          <div class="tp-bar-wrap"><div class="tp-bar" id="monthly-tp-bar"></div></div>
         </div>
       </div>
     </div>
@@ -1113,6 +1151,11 @@ async function loadPerformance() {
   document.getElementById("expectancy").textContent = fmt(p.expectancy_r, 3) + "R";
 }
 
+// Profit target thresholds (edit here to match your prop firm rules)
+const TP_DAILY   =  500;
+const TP_WEEKLY  = 1500;
+const TP_MONTHLY = 5000;
+
 async function loadDrawdown() {
   const d = await get("/analytics/drawdown");
   if (!d) return;
@@ -1135,13 +1178,50 @@ async function loadDrawdown() {
   applyDD("weekly-dd",  "card-weekly-dd",  d.weekly_loss,  d.weekly_limit  || 1500);
   applyDD("monthly-dd", "card-monthly-dd", d.monthly_loss, d.monthly_limit || 5000);
 
-  const sign = d.daily_loss >= 0 ? "+" : "";
+  const todayPnl = d.daily_pnl ?? d.daily_loss;
+  const sign = todayPnl >= 0 ? "+" : "";
   const pnlEl = document.getElementById("daily-pnl");
-  pnlEl.textContent = sign + "$" + fmt(d.daily_loss);
-  pnlEl.className = "card-value " + (d.daily_loss >= 0 ? "green" : "red");
+  pnlEl.textContent = sign + "$" + fmt(todayPnl);
+  pnlEl.className = "card-value " + (todayPnl >= 0 ? "green" : "red");
 
   const sub = document.getElementById("equity-sub");
-  if (sub) sub.textContent = "Today: " + sign + "$" + fmt(d.daily_loss);
+  if (sub) sub.textContent = "Today: " + sign + "$" + fmt(todayPnl);
+
+  // ── Profit Targets ──────────────────────────────────────────────
+  function applyTP(valId, cardId, barId, subId, pnl, target) {
+    const el   = document.getElementById(valId);
+    const card = document.getElementById(cardId);
+    const bar  = document.getElementById(barId);
+    const sub2 = document.getElementById(subId);
+    if (!el) return;
+
+    const s = pnl >= 0 ? "+" : "";
+    el.textContent = s + "$" + fmt(pnl);
+
+    const pct = target > 0 ? Math.min(Math.max(pnl / target * 100, 0), 100) : 0;
+    bar.style.width = pct + "%";
+
+    if (pnl >= target) {
+      el.className  = "card-value green";
+      card.className = "card profit-hit";
+      bar.style.background = "var(--green)";
+    } else if (pnl > 0) {
+      el.className  = "card-value green";
+      card.className = "card profit-prog";
+      bar.style.background = "var(--accent)";
+    } else {
+      el.className  = "card-value" + (pnl < 0 ? " red" : "");
+      card.className = "card profit-none";
+      bar.style.background = pnl < 0 ? "var(--red)" : "var(--border-2)";
+      bar.style.width = pnl < 0 ? "0%" : "0%";
+    }
+
+    sub2.textContent = "Target: $" + target.toLocaleString() + " · " + pct.toFixed(0) + "% reached";
+  }
+
+  applyTP("daily-profit",   "card-daily-tp",   "daily-tp-bar",   "daily-tp-sub",   d.daily_pnl   ?? 0, TP_DAILY);
+  applyTP("weekly-profit",  "card-weekly-tp",  "weekly-tp-bar",  "weekly-tp-sub",  d.weekly_pnl  ?? 0, TP_WEEKLY);
+  applyTP("monthly-profit", "card-monthly-tp", "monthly-tp-bar", "monthly-tp-sub", d.monthly_pnl ?? 0, TP_MONTHLY);
 }
 
 async function loadSessionStatus() {

@@ -55,6 +55,7 @@ class TradeCloseIn(BaseModel):
     spread: Optional[Decimal] = None
     commission: Optional[Decimal] = None
     swap: Optional[Decimal] = None
+    profit: Optional[Decimal] = None   # MT4 OrderProfit() in account currency (USD)
     exit_reason: Literal["TP", "SL", "TRAILING", "PARTIAL", "MANUAL", "CB"]
     closed_at: datetime
     account_equity: Optional[Decimal] = None  # MT4 sends current balance on close
@@ -65,6 +66,7 @@ class TradeCloseByTicketIn(BaseModel):
     spread: Optional[Decimal] = None
     commission: Optional[Decimal] = None
     swap: Optional[Decimal] = None
+    profit: Optional[Decimal] = None   # MT4 OrderProfit() in account currency (USD)
     exit_reason: Literal["TP", "SL", "TRAILING", "PARTIAL", "MANUAL", "CB"]
     closed_at: datetime
     account_equity: Optional[Decimal] = None

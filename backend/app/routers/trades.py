@@ -32,8 +32,15 @@ async def open_trade(
 
 
 async def _apply_close(trade: Trade, payload, db: AsyncSession):
-    gross_pnl = _calc_pnl(trade, payload.exit_price)
-    net_pnl = gross_pnl - (payload.commission or Decimal(0)) - abs(payload.swap or Decimal(0))
+    # Use MT4's reported profit (account currency) when available; fallback to local calc
+    # for USD-quoted pairs only. Local calc gives quote-currency units which are wrong for
+    # JPY/CAD/CHF pairs (e.g. USDJPY result would be in JPY, inflated ~160×).
+    if payload.profit is not None:
+        gross_pnl = Decimal(str(payload.profit))
+        net_pnl = gross_pnl - (payload.commission or Decimal(0)) - abs(payload.swap or Decimal(0))
+    else:
+        gross_pnl = _calc_pnl(trade, payload.exit_price)
+        net_pnl = gross_pnl - (payload.commission or Decimal(0)) - abs(payload.swap or Decimal(0))
     sl_distance = abs(trade.entry_price - trade.stop_loss) if trade.stop_loss else None
     r_multiple = (
         (gross_pnl / (sl_distance * trade.lot_size * Decimal("100000"))).quantize(Decimal("0.01"))

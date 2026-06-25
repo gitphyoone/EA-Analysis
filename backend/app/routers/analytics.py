@@ -119,14 +119,39 @@ async def drawdown_summary(
         val = result.scalar()
         return float(val or 0)
 
+    async def pnl_for_day(start: date) -> float:
+        stmt = (
+            select(func.sum(TradeHistory.net_pnl))
+            .where(TradeHistory.closed_at >= datetime(start.year, start.month, start.day, tzinfo=timezone.utc))
+            .where(TradeHistory.closed_at < datetime(start.year, start.month, start.day, 23, 59, 59, tzinfo=timezone.utc))
+        )
+        result = await db.execute(stmt)
+        val = result.scalar()
+        return float(val or 0)
+
+    async def total_pnl_for_period(start: date) -> float:
+        stmt = (
+            select(func.sum(TradeHistory.net_pnl))
+            .where(TradeHistory.closed_at >= datetime(start.year, start.month, start.day, tzinfo=timezone.utc))
+        )
+        result = await db.execute(stmt)
+        val = result.scalar()
+        return float(val or 0)
+
     daily_loss = await dd_for_period(today)
     weekly_loss = await dd_for_period(week_start)
     monthly_loss = await dd_for_period(month_start)
+    daily_pnl = await pnl_for_day(today)
+    weekly_pnl = await total_pnl_for_period(week_start)
+    monthly_pnl = await total_pnl_for_period(month_start)
 
     return {
+        "daily_pnl": round(daily_pnl, 2),
         "daily_loss": round(daily_loss, 2),
         "weekly_loss": round(weekly_loss, 2),
         "monthly_loss": round(monthly_loss, 2),
+        "weekly_pnl": round(weekly_pnl, 2),
+        "monthly_pnl": round(monthly_pnl, 2),
     }
 
 
