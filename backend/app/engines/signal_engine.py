@@ -6,6 +6,8 @@ Fixes applied:
   - FIX: Strong-ADX RSI relaxation — when ADX > 40, RSI cap is widened to 80/20
          (original cap of 70/30 blocked the strongest trend entries)
   - FIX: Optional multi-timeframe bias — pass H4/D1 trend direction to filter counter-trend entries
+  - FIX: EMA10/20 short-term alignment (Option B score-based) — misalignment costs 1 point
+         but does NOT hard-reject; strong setups (7/8) still trade through it
 Original (kept): EMA50/200 cross + RSI + ADX + DI+/DI- + ATR minimum
 """
 from decimal import Decimal
@@ -34,6 +36,8 @@ class SignalEngine:
         di_minus: Decimal,
         atr: Decimal,
         htf_trend_up: Optional[bool] = None,     # FIX: H4/D1 trend bias (None = not checked)
+        ema10: Optional[Decimal] = None,          # FIX: EMA10 for short-term alignment score
+        ema20: Optional[Decimal] = None,          # FIX: EMA20 for short-term alignment score
     ) -> SignalResult:
         cfg = self.settings
 
@@ -92,12 +96,26 @@ class SignalEngine:
 
         ema_trend = trend_up or trend_down
 
+        # ── EMA short-term alignment (score-based, not hard reject) ──
+        # EMA10 > EMA20 in uptrend → short-term bullish momentum confirmed
+        # EMA10 < EMA20 in downtrend → short-term bearish momentum confirmed
+        # None if ema10/ema20 not provided → no penalty (backward compat)
+        if ema10 is not None and ema20 is not None:
+            ema_short_ok: Optional[bool] = (
+                (trend_up   and float(ema10) > float(ema20)) or
+                (trend_down and float(ema10) < float(ema20))
+            )
+            ema_short_score = int(ema_short_ok)
+        else:
+            ema_short_ok = None
+            ema_short_score = 1   # no data — no penalty
+
         # ── Score system ──────────────────────────────────────────────
-        # 7 components (DI excluded); need 6/7 to trade.
-        # Allows 1 weaker condition (typically HTF mismatch) without blocking.
+        # 8 components (DI excluded); need 7/8 to trade (was 6/7).
+        # Allows 1 weaker condition without blocking (1 miss = still trades).
         score = sum([int(ema_trend), int(regime_ok), int(body_ok), htf_score,
-                     int(rsi_ok), int(adx_ok), int(atr_ok)])
-        _required = 6
+                     int(rsi_ok), int(adx_ok), int(atr_ok), ema_short_score])
+        _required = 7
 
         if trend_up and score >= _required:
             direction: SignalDirection = "BUY"
@@ -109,7 +127,7 @@ class SignalEngine:
             direction = "NO_TRADE"
             reject_reason = self._reject_reason(
                 trend_up, trend_down, regime_ok, body_ok, htf_score,
-                rsi_ok, adx_ok, atr_ok
+                rsi_ok, adx_ok, atr_ok, ema_short_ok
             )
 
         return SignalResult(
@@ -124,6 +142,7 @@ class SignalEngine:
             di_ok=di_ok,
             atr_ok=atr_ok,
             htf_pass=htf_pass,
+            ema_short_ok=ema_short_ok,
             current_price=current_price,
             ema50=ema50,
             ema200=ema200,
@@ -145,8 +164,9 @@ class SignalEngine:
         rsi_ok: bool,
         adx_ok: bool,
         atr_ok: bool,
+        ema_short_ok: Optional[bool],
     ) -> RejectReason:
-        # Score < 6 means 2+ conditions failed. Report highest-priority failure.
+        # Score < 7 means 2+ conditions failed. Report highest-priority failure.
         if not (trend_up or trend_down):
             return "NO_TREND"
         if not regime_ok:
@@ -159,8 +179,8 @@ class SignalEngine:
             return "RSI_OUT_OF_RANGE"
         if not atr_ok:
             return "ATR_TOO_LOW"
-        # All scored conditions passed — HTF mismatch must be compounding with
-        # a condition that evaluates to False in ways not captured above.
+        if ema_short_ok is False:
+            return "EMA_SHORT_COUNTER"
         if htf_score == 0:
             return "HTF_COUNTER_TREND"
         return "MULTI_CONDITION_FAIL"

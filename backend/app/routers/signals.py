@@ -78,6 +78,8 @@ async def evaluate_signal(
         di_minus=candle.di_minus,
         atr=candle.atr14,
         htf_trend_up=htf_trend_up,           # FIX: multi-timeframe bias
+        ema10=candle.ema10,                  # FIX: EMA10/20 short-term alignment score
+        ema20=candle.ema20,
     )
 
     # Session gate (includes Friday close check)

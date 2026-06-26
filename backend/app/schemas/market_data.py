@@ -13,6 +13,8 @@ class MarketDataIn(BaseModel):
     low: Decimal
     close: Decimal
     volume: Optional[int] = None
+    ema10: Optional[Decimal] = None
+    ema20: Optional[Decimal] = None
     ema50: Optional[Decimal] = None
     ema200: Optional[Decimal] = None
     rsi14: Optional[Decimal] = None

@@ -13,6 +13,7 @@ RejectReason = Literal[
     "ADX_WEAK",             # ADX below minimum — trend not strong enough
     "RSI_OUT_OF_RANGE",     # RSI outside buy/sell window for this direction
     "ATR_TOO_LOW",          # ATR below minimum — insufficient volatility
+    "EMA_SHORT_COUNTER",    # EMA10/20 counter to H1 trend — bounce entry risk
     "HTF_COUNTER_TREND",    # H4/D1 trend opposes entry direction
     "MULTI_CONDITION_FAIL", # 2+ conditions failed — no single dominant reason
     "OFF_SESSION",          # Outside allowed trading session window
@@ -25,13 +26,14 @@ class SignalResult(BaseModel):
     timeframe: str
     timestamp: datetime
     direction: SignalDirection
-    score: int                          # number of conditions met (max 7)
+    score: int                              # number of conditions met (max 8)
     ema_trend: bool
     rsi_ok: bool
     adx_ok: bool
     di_ok: bool
     atr_ok: bool
-    htf_pass: Optional[bool] = None    # None = no H4 data; True/False = aligned/counter
+    htf_pass: Optional[bool] = None        # None = no H4 data; True/False = aligned/counter
+    ema_short_ok: Optional[bool] = None    # None = no EMA10/20 data; True/False = aligned/counter
     current_price: Decimal
     ema50: Decimal
     ema200: Decimal

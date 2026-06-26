@@ -18,6 +18,8 @@ class MarketData(Base):
     low: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     close: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
     volume: Mapped[Optional[int]] = mapped_column(BigInteger)
+    ema10: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
+    ema20: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     ema50: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     ema200: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     rsi14: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))

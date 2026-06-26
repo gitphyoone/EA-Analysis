@@ -104,6 +104,8 @@ void CollectAndSend(string sym, datetime ts) {
     long   v  = iVolume(sym, Timeframe, 1);
 
     // Indicators (bar 1 = closed bar — confirmed, no repaint)
+    double ema10  = iMA(sym, Timeframe, 10,  0, MODE_EMA, PRICE_CLOSE, 1);
+    double ema20  = iMA(sym, Timeframe, 20,  0, MODE_EMA, PRICE_CLOSE, 1);
     double ema50  = iMA(sym, Timeframe, 50,  0, MODE_EMA, PRICE_CLOSE, 1);
     double ema200 = iMA(sym, Timeframe, 200, 0, MODE_EMA, PRICE_CLOSE, 1);
     double rsi    = iRSI(sym, Timeframe, 14, PRICE_CLOSE, 1);
@@ -126,6 +128,8 @@ void CollectAndSend(string sym, datetime ts) {
         "\"low\":%.6f,"
         "\"close\":%.6f,"
         "\"volume\":%I64d,"
+        "\"ema10\":%.6f,"
+        "\"ema20\":%.6f,"
         "\"ema50\":%.6f,"
         "\"ema200\":%.6f,"
         "\"rsi14\":%.4f,"
@@ -137,7 +141,7 @@ void CollectAndSend(string sym, datetime ts) {
         sym,
         FormatTimestamp(iTime(sym, Timeframe, 1)),   // FIX: was TimeToString()
         o, h, l, c, v,
-        ema50, ema200, rsi, adx, di_p, di_m, atr
+        ema10, ema20, ema50, ema200, rsi, adx, di_p, di_m, atr
     );
 
     string headers = "Content-Type: application/json\r\n";
