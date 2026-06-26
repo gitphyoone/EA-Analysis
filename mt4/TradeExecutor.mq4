@@ -488,14 +488,19 @@ void DetectAndReportClosedTrades() {
         CleanupLegacyGV(ticket);
         double cp=OrderClosePrice(),tp=OrderTakeProfit(),sl=OrderStopLoss();
         double ps=(StringFind(sym,"JPY")>=0)?0.01:0.0001;
-        string reason="MANUAL";
-        if (tp>0&&MathAbs(cp-tp)<=ps*3) reason="TP";
-        else if (sl>0&&MathAbs(cp-sl)<=ps*3) reason="SL";
+        // Detect TP/SL using actual close price
+        // Supports trailing SL and broker execution tolerance
+        // ps*5 = tolerance for execution spread/slippage
+        double tol    = ps * 5;
+        bool hit_tp   = tp > 0 && MathAbs(cp - tp) <= tol;
+        bool hit_sl   = sl > 0 && MathAbs(cp - sl) <= tol;
+        string reason = "MANUAL";
+        if      (hit_tp) reason = "TP";
+        else if (hit_sl) reason = "SL";
         string body=StringFormat(
             "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,"
-            "\"profit\":%.2f,"
             "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
-            cp,OrderCommission(),OrderSwap(),OrderProfit(),reason,FormatISO8601(close_time),AccountEquity());
+            cp,OrderCommission(),OrderSwap(),reason,FormatISO8601(close_time),AccountEquity());
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
         StringToCharArray(body,post,0,StringLen(body));
