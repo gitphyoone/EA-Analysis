@@ -4,6 +4,8 @@ from sqlalchemy import select, func
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal
 
+JST = timezone(timedelta(hours=9))  # Japan Standard Time
+
 from ..database import get_db
 from ..models.trade import Trade, TradeHistory
 from ..models.journal import QuantJournal
@@ -55,9 +57,9 @@ async def performance_summary(
 ):
     stmt = select(TradeHistory)
     if from_date:
-        stmt = stmt.where(TradeHistory.closed_at >= datetime(from_date.year, from_date.month, from_date.day, tzinfo=timezone.utc))
+        stmt = stmt.where(TradeHistory.closed_at >= datetime(from_date.year, from_date.month, from_date.day, tzinfo=JST))
     if to_date:
-        stmt = stmt.where(TradeHistory.closed_at <= datetime(to_date.year, to_date.month, to_date.day, 23, 59, 59, tzinfo=timezone.utc))
+        stmt = stmt.where(TradeHistory.closed_at <= datetime(to_date.year, to_date.month, to_date.day, 23, 59, 59, tzinfo=JST))
     stmt = stmt.order_by(TradeHistory.closed_at)
 
     result = await db.execute(stmt)
@@ -105,14 +107,21 @@ async def drawdown_summary(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    today = date.today()
+    now_jst = datetime.now(JST)
+    today = now_jst.date()
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
+
+    def jst_day_start(d: date) -> datetime:
+        return datetime(d.year, d.month, d.day, tzinfo=JST)
+
+    def jst_day_end(d: date) -> datetime:
+        return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=JST)
 
     async def dd_for_period(start: date) -> float:
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
-            .where(TradeHistory.closed_at >= datetime(start.year, start.month, start.day, tzinfo=timezone.utc))
+            .where(TradeHistory.closed_at >= jst_day_start(start))
             .where(TradeHistory.net_pnl < 0)
         )
         result = await db.execute(stmt)
@@ -122,8 +131,8 @@ async def drawdown_summary(
     async def pnl_for_day(start: date) -> float:
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
-            .where(TradeHistory.closed_at >= datetime(start.year, start.month, start.day, tzinfo=timezone.utc))
-            .where(TradeHistory.closed_at < datetime(start.year, start.month, start.day, 23, 59, 59, tzinfo=timezone.utc))
+            .where(TradeHistory.closed_at >= jst_day_start(start))
+            .where(TradeHistory.closed_at <= jst_day_end(start))
         )
         result = await db.execute(stmt)
         val = result.scalar()
@@ -132,7 +141,7 @@ async def drawdown_summary(
     async def total_pnl_for_period(start: date) -> float:
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
-            .where(TradeHistory.closed_at >= datetime(start.year, start.month, start.day, tzinfo=timezone.utc))
+            .where(TradeHistory.closed_at >= jst_day_start(start))
         )
         result = await db.execute(stmt)
         val = result.scalar()
@@ -182,7 +191,7 @@ async def signal_rejects(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(JST) - timedelta(days=days)
 
     # Top reject reasons
     reason_rows = await db.execute(
@@ -234,15 +243,40 @@ async def signal_rejects(
 
 @router.get("/trade-history")
 async def trade_history(
-    limit: int = 100,
+    limit: int = Query(default=20, ge=1, le=300),
+    offset: int = Query(default=0, ge=0),
+    symbol: str = Query(default=""),
+    direction: str = Query(default=""),
+    period: str = Query(default=""),   # today | week | month | "" (all)
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    result = await db.execute(
-        select(TradeHistory).order_by(TradeHistory.closed_at.desc()).limit(limit)
-    )
-    rows = result.scalars().all()
-    return [
+    stmt = select(TradeHistory)
+
+    if symbol:
+        stmt = stmt.where(TradeHistory.symbol.ilike(f"%{symbol}%"))
+    if direction in ("BUY", "SELL"):
+        stmt = stmt.where(TradeHistory.direction == direction)
+    if period:
+        now_jst = datetime.now(JST)
+        today_j = now_jst.date()
+        if period == "today":
+            start = datetime(today_j.year, today_j.month, today_j.day, tzinfo=JST)
+            stmt = stmt.where(TradeHistory.closed_at >= start)
+        elif period == "week":
+            ws = today_j - timedelta(days=today_j.weekday())
+            stmt = stmt.where(TradeHistory.closed_at >= datetime(ws.year, ws.month, ws.day, tzinfo=JST))
+        elif period == "month":
+            ms = today_j.replace(day=1)
+            stmt = stmt.where(TradeHistory.closed_at >= datetime(ms.year, ms.month, ms.day, tzinfo=JST))
+
+    total_res = await db.execute(select(func.count()).select_from(stmt.subquery()))
+    total = total_res.scalar() or 0
+
+    stmt = stmt.order_by(TradeHistory.closed_at.desc()).offset(offset).limit(limit)
+    rows = (await db.execute(stmt)).scalars().all()
+
+    trades = [
         {
             "ticket": r.ticket,
             "symbol": r.symbol,
@@ -268,6 +302,7 @@ async def trade_history(
         }
         for r in rows
     ]
+    return {"total": total, "trades": trades}
 
 
 @router.get("/signal-log")
@@ -279,7 +314,7 @@ async def signal_log(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(JST) - timedelta(days=days)
     q = select(SignalLog).where(SignalLog.created_at >= since)
 
     if type == "entry":

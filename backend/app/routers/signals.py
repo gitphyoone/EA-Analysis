@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, timedelta, date
+
+JST = timezone(timedelta(hours=9))
 from decimal import Decimal
 from typing import Optional
 import pytz
@@ -109,7 +111,8 @@ async def get_circuit_breaker(
     settings = get_settings()
 
     # FIX: calculate realized losses from closed trades today (was ignored before)
-    today_start = datetime(date.today().year, date.today().month, date.today().day, tzinfo=timezone.utc)
+    today_jst = datetime.now(JST).date()
+    today_start = datetime(today_jst.year, today_jst.month, today_jst.day, tzinfo=JST)
     result = await db.execute(
         select(func.coalesce(func.sum(TradeHistory.net_pnl), 0))
         .where(TradeHistory.closed_at >= today_start)

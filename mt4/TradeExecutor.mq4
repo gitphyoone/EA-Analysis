@@ -8,7 +8,7 @@
 //|  20. ATR sanity guard — skip trade if ATR abnormal              |
 //|      non-JPY valid: 0.0005–0.0050, JPY: 0.050–0.500            |
 //|      Prevents SL=1pip + lot explosion from stale data           |
-//|  21. TP = entry ± SL_dist × 2.0  (2R, was 3R)                 |
+//|  21. TP = entry ± SL_dist × 3.0  (3R, partial at 2R → trail)  |
 //|  22. Partial close 30% at +2R    (was 50%)                     |
 //|  23. SL → +1R after partial close (locks 1R profit)            |
 //|  24. 0.5R step-trail after partial:                             |
@@ -46,7 +46,7 @@ input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
 // ── Exit logic ───────────────────────────────────────────────────────
-input double TP_R_Multiple          = 2.0;   // TP = SL_dist × 2R
+input double TP_R_Multiple          = 3.0;   // TP = SL_dist × 3R (partial at 2R → step-trail)
 input double Partial_Close_At_R     = 2.0;   // partial trigger
 input double Partial_Close_Ratio    = 0.30;  // 30% close at +2R
 

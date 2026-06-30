@@ -772,15 +772,31 @@
     </div>
 
     <div>
-      <div class="toolbar">
+      <div class="toolbar" style="flex-wrap:wrap;gap:8px">
         <div class="section-label"><span>Trade History</span></div>
-        <div class="toolbar-controls">
-          <select id="hist-limit">
-            <option value="50">Last 50</option>
-            <option value="100">Last 100</option>
-            <option value="200">Last 200</option>
+        <div class="toolbar-controls" style="flex-wrap:wrap;gap:6px">
+          <input type="text" id="hist-symbol" placeholder="Symbol…" style="width:88px"
+                 onkeydown="if(event.key==='Enter')loadTradeHistory(1)">
+          <div class="type-filter" id="hist-dir-filter">
+            <button class="type-btn active" data-dir=""     onclick="setHistDir(this)">All</button>
+            <button class="type-btn"        data-dir="BUY"  onclick="setHistDir(this)">BUY</button>
+            <button class="type-btn"        data-dir="SELL" onclick="setHistDir(this)">SELL</button>
+          </div>
+          <select id="hist-period">
+            <option value="">All time</option>
+            <option value="today">Today</option>
+            <option value="week">This week</option>
+            <option value="month">This month</option>
           </select>
-          <button class="btn" onclick="loadTradeHistory()">Refresh</button>
+          <select id="hist-limit">
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="30">30</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="300">300</option>
+          </select>
+          <button class="btn btn-primary" onclick="loadTradeHistory(1)">Apply</button>
         </div>
       </div>
       <div class="table-card">
@@ -805,6 +821,14 @@
             </tbody>
             <tfoot id="history-foot"></tfoot>
           </table>
+        </div>
+        <div id="history-pagination" style="display:flex;align-items:center;justify-content:space-between;padding:10px 16px;border-top:1px solid var(--border)">
+          <span id="history-showing" style="font-size:12px;color:var(--text-3)">—</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn" id="hist-prev" onclick="histPage(-1)" disabled>← Prev</button>
+            <span id="hist-page-info" style="font-size:12px;color:var(--text-2)">—</span>
+            <button class="btn" id="hist-next" onclick="histPage(1)"  disabled>Next →</button>
+          </div>
         </div>
       </div>
     </div>
@@ -1421,17 +1445,57 @@ async function loadOpenPositions() {
 }
 
 // ─── Trade History ─────────────────────────────────────────────────────────────
-async function loadTradeHistory() {
-  const limit  = document.getElementById("hist-limit").value;
-  const trades = await get(`/analytics/trade-history?limit=${limit}`);
-  const tbody  = document.getElementById("history-body");
-  document.getElementById("hist-count").textContent = trades ? trades.length : 0;
+let _histPage  = 1;
+let _histDir   = "";
+let _histTotal = 0;
+
+function setHistDir(btn) {
+  _histDir = btn.dataset.dir;
+  btn.closest(".type-filter").querySelectorAll(".type-btn").forEach(b => b.classList.toggle("active", b === btn));
+}
+
+function histPage(delta) {
+  const limit = parseInt(document.getElementById("hist-limit").value);
+  const totalPages = Math.max(1, Math.ceil(_histTotal / limit));
+  const newPage = _histPage + delta;
+  if (newPage >= 1 && newPage <= totalPages) loadTradeHistory(newPage);
+}
+
+async function loadTradeHistory(page) {
+  if (page !== undefined) _histPage = page;
+  const limit  = parseInt(document.getElementById("hist-limit").value);
+  const symbol = (document.getElementById("hist-symbol").value || "").trim();
+  const period = document.getElementById("hist-period").value;
+  const offset = (_histPage - 1) * limit;
+
+  const params = new URLSearchParams({ limit, offset });
+  if (symbol)  params.set("symbol",    symbol);
+  if (_histDir) params.set("direction", _histDir);
+  if (period)  params.set("period",    period);
+
+  const tbody = document.getElementById("history-body");
+  tbody.innerHTML = "<tr class='empty-row'><td colspan='19'><span class='spinner'></span> Loading…</td></tr>";
+
+  const data   = await get(`/analytics/trade-history?${params}`);
+  const trades = data ? data.trades : [];
+  const total  = data ? data.total  : 0;
+  _histTotal   = total;
+
+  const totalPages = Math.max(1, Math.ceil(total / limit));
+  const from = total ? offset + 1 : 0;
+  const to   = Math.min(offset + limit, total);
+
+  document.getElementById("hist-count").textContent       = total || 0;
+  document.getElementById("history-showing").textContent  = total ? `Showing ${from}–${to} of ${total} trades` : "No trades";
+  document.getElementById("hist-page-info").textContent   = `Page ${_histPage} of ${totalPages}`;
+  document.getElementById("hist-prev").disabled = _histPage <= 1;
+  document.getElementById("hist-next").disabled = _histPage >= totalPages;
 
   const foot = document.getElementById("history-foot");
 
-  if (!trades || !trades.length) {
-    tbody.innerHTML = "<tr class='empty-row'><td colspan='19'>No trade history</td></tr>";
-    foot.innerHTML = "";
+  if (!trades.length) {
+    tbody.innerHTML = "<tr class='empty-row'><td colspan='19'>No trades found</td></tr>";
+    foot.innerHTML  = "";
     return;
   }
 
@@ -1463,7 +1527,7 @@ async function loadTradeHistory() {
     </tr>`;
   }).join("");
 
-  // ── totals ──
+  // ── page totals ──
   const totalGross = trades.reduce((s, t) => s + parseFloat(t.gross_pnl || 0), 0);
   const totalNet   = trades.reduce((s, t) => s + parseFloat(t.net_pnl   || 0), 0);
   const totalComm  = trades.reduce((s, t) => s + parseFloat(t.commission || 0), 0);
@@ -1477,7 +1541,7 @@ async function loadTradeHistory() {
   const rCls       = avgR >= 0 ? "pos" : "neg";
 
   foot.innerHTML = `<tr>
-    <td class="total-label" colspan="2">TOTAL  ${trades.length} trades</td>
+    <td class="total-label" colspan="2">PAGE  ${trades.length} trades</td>
     <td style="font-size:11px"><span class="pos">${wins}W</span> / <span class="neg">${losses}L</span></td>
     <td colspan="2"></td>
     <td>${fmt(totalLots, 2)}</td>
@@ -1616,7 +1680,7 @@ let _reasonType = "all";
 
 function setReasonType(btn) {
   _reasonType = btn.dataset.type;
-  document.querySelectorAll(".type-btn").forEach(b => b.classList.toggle("active", b === btn));
+  btn.closest(".type-filter").querySelectorAll(".type-btn").forEach(b => b.classList.toggle("active", b === btn));
 }
 
 async function loadSignalLog() {
