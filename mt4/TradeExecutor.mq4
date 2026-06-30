@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT4 Trade Executor v2.09                     |
+//| V19 FX Prop Desk — MT4 Trade Executor v2.10                     |
 //| ALL FIXES:                                                       |
 //|  1-18. (duplicate entry, partial cascade, symbol+magic GV)      |
 //| ──────────────────────────────────────────────────────────────── |
@@ -17,9 +17,13 @@
 //|  25. TP auto-extend when price passes TP (trend continuation)   |
 //|      new_tp = entry + (r_step+0.5) × sl_dist                   |
 //|  26. TP extend bug fix: uses OrderStopLoss() not target_sl      |
+//| v2.10:                                                           |
+//|  27. CB hysteresis recovery (CB_Reset_Ratio=0.5)                |
+//|      L1 resets below 1.5%, L2 resets to L1 below 2.5%          |
+//|      L3 remains day-locked (no recovery)                        |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "2.09"
+#property version   "2.10"
 #property strict
 
 #include <stdlib.mqh>
@@ -54,6 +58,7 @@ input double Partial_Close_Ratio    = 0.30;  // 30% close at +2R
 input double CB_Level1_DD_Pct       = 3.0;
 input double CB_Level2_DD_Pct       = 5.0;
 input double CB_Level3_DD_Pct       = 8.0;
+input double CB_Reset_Ratio         = 0.5;  // recover below 50% of trigger → unlock
 
 // ── CB state ─────────────────────────────────────────────────────────
 int    cb_level = 0;
@@ -229,19 +234,29 @@ bool IsFridayClose() {
     return (DayOfWeek()==5 && TimeHour(now)>=Friday_Close_Hour);
 }
 void CheckCircuitBreaker() {
-    double eq=AccountEquity(),bal=AccountBalance();
-    if (eq<=0||bal<=0) return;
-    double realized=FetchRealizedDailyLoss();
-    double dd_pct=MathAbs(realized+MathMin(0,eq-bal))/bal*100.0;
-    int nl=0;
-    if      (dd_pct>=CB_Level3_DD_Pct) nl=3;
-    else if (dd_pct>=CB_Level2_DD_Pct) nl=2;
-    else if (dd_pct>=CB_Level1_DD_Pct) nl=1;
-    if (nl<=cb_level) return;
-    cb_level=nl;
-    string msg=StringFormat("[CB] LEVEL %d — DD=%.2f%%",cb_level,dd_pct);
-    Print(msg); SendTelegram(msg);
-    if (cb_level==3) CloseAllPositions("CB_L3");
+    double equity  = AccountEquity();
+    double balance = AccountBalance();
+    if (equity<=0 || balance<=0) return;
+
+    double realized   = FetchRealizedDailyLoss();
+    double total_loss = realized + MathMin(0, equity-balance);
+    double dd_pct     = MathAbs(total_loss)/balance*100.0;
+
+    int new_level=0;
+    if      (dd_pct>=CB_Level3_DD_Pct) new_level=3;
+    else if (dd_pct>=CB_Level2_DD_Pct) new_level=2;
+    else if (dd_pct>=CB_Level1_DD_Pct) new_level=1;
+
+    if (cb_level==2 && dd_pct < CB_Level2_DD_Pct*CB_Reset_Ratio) new_level=1;
+    if (cb_level==1 && dd_pct < CB_Level1_DD_Pct*CB_Reset_Ratio) new_level=0;
+    if (cb_level==3) new_level=3;
+
+    if (new_level!=cb_level) {
+        string msg=StringFormat("[CB] LEVEL %d -> %d | DD=%.2f%%",cb_level,new_level,dd_pct);
+        cb_level=new_level;
+        Print(msg); SendTelegram(msg);
+        if (cb_level==3) CloseAllPositions("CB_L3");
+    }
 }
 double FetchRealizedDailyLoss() {
     string url=GETUrl("/analytics/drawdown");
