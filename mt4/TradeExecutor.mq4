@@ -21,6 +21,24 @@
 //|  27. CB hysteresis recovery (CB_Reset_Ratio=0.5)                |
 //|      L1 resets below 1.5%, L2 resets to L1 below 2.5%          |
 //|      L3 remains day-locked (no recovery)                        |
+//|  28. Bug 1 fix: partial-close remainder ticket registration     |
+//|      Root cause: broker creates a NEW ticket for the 70%        |
+//|      remainder after OrderClose(partial). That new ticket had   |
+//|      no matching "open" record in DB, so close report 404'd     |
+//|      and remainder P&L was silently lost from TradeHistory.     |
+//|      Fix: scan for the remainder ticket right after partial     |
+//|      close (same symbol+magic+type+entry, different ticket#),   |
+//|      apply the +1R SL to the CORRECT ticket, then register it   |
+//|      with NotifyBackend() so the later close report succeeds.   |
+//|  29. NULL-value bug fix: original remainder NotifyBackend()     |
+//|      call sent signal_score/rsi/adx/di as 0 — these are valid   |
+//|      values for other fields and would corrupt analytics        |
+//|      averages (e.g. "ADX=0" trades would skew ADX stats).       |
+//|      Fixed: sentinel value -1 used instead for score/rsi/adx/   |
+//|      di_plus/di_minus so backend/analytics can filter these out |
+//|      as "remainder, no original signal snapshot available".     |
+//|      risk_amt=0 kept intentionally — remainder is not a new     |
+//|      risk allocation, it continues the original entry's risk.   |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
 #property version   "2.10"
@@ -28,7 +46,7 @@
 
 #include <stdlib.mqh>
 
-// ── Inputs ───────────────────────────────────────────────────────────
+// Inputs
 input string FastAPI_Base           = "http://127.0.0.1";
 input string API_Key                = "f9e369ad5592a0dcd33c78c4e33bd382";
 input string Symbol_List            = "EURUSD,GBPUSD,USDJPY.y,AUDUSD,USDCAD,GBPJPY";
@@ -42,33 +60,27 @@ input string Telegram_Token         = "";
 input string Telegram_Chat_ID       = "";
 input bool   Debug                  = true;
 
-// ── Position / Risk controls ─────────────────────────────────────────
 input int    Max_Open_Positions     = 5;
 input double Portfolio_Max_Risk_Pct = 6.0;
 input double Risk_Per_Trade_Pct     = 1.0;
 input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
-// ── Exit logic ───────────────────────────────────────────────────────
-input double TP_R_Multiple          = 3.0;   // TP = SL_dist × 3R (partial at 2R → step-trail)
-input double Partial_Close_At_R     = 2.0;   // partial trigger
-input double Partial_Close_Ratio    = 0.30;  // 30% close at +2R
+input double TP_R_Multiple          = 3.0;
+input double Partial_Close_At_R     = 2.0;
+input double Partial_Close_Ratio    = 0.30;
 
-// ── Circuit breaker ──────────────────────────────────────────────────
 input double CB_Level1_DD_Pct       = 3.0;
 input double CB_Level2_DD_Pct       = 5.0;
 input double CB_Level3_DD_Pct       = 8.0;
-input double CB_Reset_Ratio         = 0.5;  // recover below 50% of trigger → unlock
+input double CB_Reset_Ratio         = 0.5;
 
-// ── CB state ─────────────────────────────────────────────────────────
 int    cb_level = 0;
 string cb_date  = "";
 
-// ── Closed-trade reporting ───────────────────────────────────────────
 int reported_closed_tickets[500];
 int n_reported_closed = 0;
 
-// ── In-memory opened symbols (broker delay guard) ────────────────────
 string g_opened_symbols[50];
 int    g_opened_count = 0;
 
@@ -92,9 +104,6 @@ void ClearOpenedSymbol(string sym) {
     }
 }
 
-// ── Symbol+Magic partial close tracking ─────────────────────────────
-// Key: "PC_{symbol}_{magic}" — ticket-agnostic, EA-isolated
-// Cleared only when HasOpenPosition(sym)==false (fully closed)
 string GV_PC(string sym) {
     return "PC_" + sym + "_" + IntegerToString(Magic_Number);
 }
@@ -103,17 +112,14 @@ void MarkSymbolPartialClosed(string sym) { GlobalVariableSet(GV_PC(sym),(double)
 void ClearSymbolPartialClosed(string sym) {
     if (GlobalVariableCheck(GV_PC(sym))) GlobalVariableDel(GV_PC(sym));
 }
-// Legacy cleanup: old PC_{ticket} GVs from v2.07
 void CleanupLegacyGV(int ticket) {
     string gv = "PC_" + IntegerToString(ticket);
     if (GlobalVariableCheck(gv)) GlobalVariableDel(gv);
 }
 
-// ── State ────────────────────────────────────────────────────────────
 string symbols[];
 int    num_symbols = 0;
 
-// ── JSON helpers ─────────────────────────────────────────────────────
 double JsonDouble(string body, string key) {
     string search = "\"" + key + "\":";
     int pos = StringFind(body, search);
@@ -137,7 +143,6 @@ string JsonString(string body, string key) {
 }
 int JsonInt(string body, string key) { return (int)JsonDouble(body, key); }
 
-// ── Helpers ──────────────────────────────────────────────────────────
 string FormatTimestamp(datetime dt) {
     string s = TimeToString(dt, TIME_DATE|TIME_SECONDS);
     StringReplace(s,".","-"); StringReplace(s,".","-"); StringReplace(s," ","T");
@@ -194,7 +199,6 @@ string TodayString() {
     return StringFormat("%04d%02d%02d",TimeYear(now),TimeMonth(now),TimeDay(now));
 }
 
-// ── Init / Deinit ────────────────────────────────────────────────────
 int OnInit() {
     string raw=Symbol_List; StringReplace(raw," ","");
     string tmp[]; int n=StringSplit(raw,',',tmp);
@@ -203,17 +207,16 @@ int OnInit() {
     num_symbols=n; g_opened_count=0;
     for (int j=0;j<ArraySize(g_opened_symbols);j++) g_opened_symbols[j]="";
     EventSetTimer(Poll_Seconds);
-    Print("[Executor v2.09] Initialized"
+    Print("[Executor v2.10] Initialized"
           " | symbols=",Symbol_List," | magic=",Magic_Number,
           " | max_pos=",Max_Open_Positions," | portfolio=",Portfolio_Max_Risk_Pct,"%"
           " | risk=",Risk_Per_Trade_Pct,"% | TP=",TP_R_Multiple,"R"
           " | partial=",Partial_Close_Ratio*100,"% @+",Partial_Close_At_R,"R"
-          " | 0.5R step-trail");
+          " | 0.5R step-trail | CB_reset=",CB_Reset_Ratio);
     return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason) { EventKillTimer(); }
 
-// ── Timer ────────────────────────────────────────────────────────────
 void OnTimer() {
     string today=TodayString();
     if (cb_date!=today) { cb_level=0; cb_date=today; }
@@ -228,7 +231,6 @@ void OnTimer() {
     EvaluateSignals();
 }
 
-// ── Circuit Breaker ──────────────────────────────────────────────────
 bool IsFridayClose() {
     datetime now=TimeGMT();
     return (DayOfWeek()==5 && TimeHour(now)>=Friday_Close_Hour);
@@ -271,7 +273,6 @@ double FetchRealizedDailyLoss() {
     return -MathAbs(StringToDouble(StringSubstr(body,pos,end-pos)));
 }
 
-// ── Signal Evaluation ────────────────────────────────────────────────
 void EvaluateSignals() {
     for (int i=0;i<num_symbols;i++) {
         string sym=symbols[i];
@@ -328,11 +329,9 @@ void LogRejectReason(string sym,int score,string reason) {
     if(Debug&&res!=200&&res!=201&&res!=404) Print("[Executor] LogReject HTTP=",res," ",sym);
 }
 
-// ── Open Trade ───────────────────────────────────────────────────────
 void OpenTrade(string sym,string dir,int sc,double rsi,double adx,
                double dip,double dim,double e50,double e200) {
     double atr=iATR(sym,60,14,1);
-    // FIX 20: ATR sanity guard — prevents SL=1pip from stale/missing data
     double atr_min=(StringFind(sym,"JPY")>=0)?0.050:0.0005;
     double atr_max=(StringFind(sym,"JPY")>=0)?0.500:0.0050;
     if (atr<=0||atr<atr_min||atr>atr_max) {
@@ -372,7 +371,6 @@ void OpenTrade(string sym,string dir,int sc,double rsi,double adx,
     NotifyBackend(ticket,sym,dir,price,sl,tp,lots,equity,risk_amt,atr,sc,rsi,adx,dip,dim,e50,e200);
 }
 
-// ── Manage Open Positions ────────────────────────────────────────────
 void ManageOpenTrades() {
     for (int i=OrdersTotal()-1;i>=0;i--) {
         if (!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
@@ -385,14 +383,12 @@ void ManageOpenTrades() {
         double r=(OrderType()==OP_BUY)?(cur-entry)/sl_dist:(entry-cur)/sl_dist;
         double ps=(StringFind(sym,"JPY")>=0)?0.01:0.0001;
 
-        // Break-even at +1R
         double be_sl=(OrderType()==OP_BUY)?entry+ps*BE_Buffer_Pips:entry-ps*BE_Buffer_Pips;
         bool be_set=(OrderType()==OP_BUY)?(sl>=be_sl-ps*0.1):(sl<=be_sl+ps*0.1);
         if (r>=1.0&&!be_set)
             if (OrderModify(ticket,entry,be_sl,OrderTakeProfit(),0,clrYellow))
                 if(Debug) Print("[Mgr] BE moved ticket=",ticket);
 
-        // FIX 22-23: 30% partial close at +2R, SL→+1R
         if (r>=Partial_Close_At_R&&!IsSymbolPartialClosed(sym)) {
             if (OrderLots()<=0.02) {
                 MarkSymbolPartialClosed(sym);
@@ -400,16 +396,41 @@ void ManageOpenTrades() {
             } else {
                 double close_lot=NormalizeDouble(OrderLots()*Partial_Close_Ratio,2);
                 close_lot=MathMax(close_lot,MarketInfo(sym,MODE_MINLOT));
-                MarkSymbolPartialClosed(sym);  // mark before attempt
+                int    pre_type=(OrderType()==OP_BUY)?OP_BUY:OP_SELL;
+                string pre_dir =(pre_type==OP_BUY)?"BUY":"SELL";
+                MarkSymbolPartialClosed(sym);
                 bool ok=OrderClose(ticket,close_lot,cur,Slippage,clrOrange);
                 if (ok) {
-                    // SL → +1R after partial (lock 1R profit)
-                    double sl_1r=(OrderType()==OP_BUY)?entry+sl_dist:entry-sl_dist;
-                    bool sl_ok=(OrderType()==OP_BUY)?(sl_1r>sl):(sl_1r<sl||sl==0);
-                    if (sl_ok)
-                        if (OrderModify(ticket,entry,sl_1r,OrderTakeProfit(),0,clrGreen))
-                            if(Debug) Print("[Mgr] Partial 30% SL→+1R ticket=",ticket,
+                    int rem_tick=-1;
+                    for (int j=0;j<OrdersTotal();j++) {
+                        if (!OrderSelect(j,SELECT_BY_POS,MODE_TRADES)) continue;
+                        if (OrderMagicNumber()!=Magic_Number) continue;
+                        if (OrderSymbol()!=sym) continue;
+                        if (OrderTicket()==ticket) continue;
+                        if (OrderType()!=pre_type) continue;
+                        if (MathAbs(OrderOpenPrice()-entry)>ps*2) continue;
+                        rem_tick=OrderTicket();
+                        break;
+                    }
+                    double sl_1r=(pre_type==OP_BUY)?entry+sl_dist:entry-sl_dist;
+                    bool sl_ok=(pre_type==OP_BUY)?(sl_1r>sl):(sl_1r<sl||sl==0);
+                    int mod_tick=(rem_tick>0)?rem_tick:ticket;
+                    if (sl_ok&&OrderSelect(mod_tick,SELECT_BY_TICKET,MODE_TRADES))
+                        if (OrderModify(mod_tick,entry,sl_1r,OrderTakeProfit(),0,clrGreen))
+                            if(Debug) Print("[Mgr] Partial 30% SL→+1R ticket=",mod_tick,
                                             " sl_1r=",DoubleToStr(sl_1r,5));
+
+                    if (rem_tick>0&&OrderSelect(rem_tick,SELECT_BY_TICKET,MODE_TRADES)) {
+                        NotifyBackend(rem_tick,sym,pre_dir,OrderOpenPrice(),
+                                      OrderStopLoss(),OrderTakeProfit(),OrderLots(),
+                                      AccountEquity(),0,iATR(sym,60,14,0),
+                                      -1,-1,-1,-1,-1,0,0);
+                        Print("[Mgr] Partial remainder registered: ticket=",rem_tick," orig=",ticket);
+                    } else if (rem_tick<0) {
+                        Print("[Mgr] WARNING: remainder ticket not found for ",sym,
+                              " orig=",ticket," — close report will 404 (P&L may be lost)");
+                    }
+
                     string msg=StringFormat("[Trade PARTIAL] ticket=%d %s 30%% @ %.5f | SL→+1R",
                                             ticket,sym,cur);
                     if(Debug) Print(msg); SendTelegram(msg);
@@ -419,8 +440,6 @@ void ManageOpenTrades() {
             }
         }
 
-        // FIX 24: 0.5R step-trail after partial
-        // r_step = floor(r×2)/2 → SL = entry + (r_step-1) × sl_dist
         if (IsSymbolPartialClosed(sym)&&r>=Partial_Close_At_R) {
             double r_step=MathFloor(r*2.0)/2.0;
             if (r_step<Partial_Close_At_R) r_step=Partial_Close_At_R;
@@ -436,21 +455,19 @@ void ManageOpenTrades() {
                                     " step=",DoubleToStr(r_step,1),
                                     " → SL=",DoubleToStr(target_sl,5));
 
-            // FIX 25+26: TP extend — use OrderStopLoss() not target_sl
             double cur_tp=OrderTakeProfit();
             double new_tp=(OrderType()==OP_BUY)
                           ?entry+(r_step+0.5)*sl_dist
                           :entry-(r_step+0.5)*sl_dist;
             bool tp_behind=(OrderType()==OP_BUY)?(cur>=cur_tp-ps):(cur<=cur_tp+ps);
             if (tp_behind&&MathAbs(new_tp-cur_tp)>ps)
-                if (OrderModify(ticket,entry,OrderStopLoss(),new_tp,0,clrBlue))  // FIX 26
+                if (OrderModify(ticket,entry,OrderStopLoss(),new_tp,0,clrBlue))
                     if(Debug) Print("[Mgr] TP extended ticket=",ticket,
                                     " new_tp=",DoubleToStr(new_tp,5));
         }
     }
 }
 
-// ── Level 2: close losers, protect winners ───────────────────────────
 void Level2ProtectTrades() {
     for (int i=OrdersTotal()-1;i>=0;i--) {
         if (!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
@@ -475,7 +492,6 @@ void Level2ProtectTrades() {
     }
 }
 
-// ── Detect and report closed trades ──────────────────────────────────
 string FormatISO8601(datetime dt) {
     string s=TimeToString(dt,TIME_DATE|TIME_SECONDS);
     StringReplace(s,".","_"); StringReplace(s,"_","-");
@@ -503,9 +519,6 @@ void DetectAndReportClosedTrades() {
         CleanupLegacyGV(ticket);
         double cp=OrderClosePrice(),tp=OrderTakeProfit(),sl=OrderStopLoss();
         double ps=(StringFind(sym,"JPY")>=0)?0.01:0.0001;
-        // Detect TP/SL using actual close price
-        // Supports trailing SL and broker execution tolerance
-        // ps*5 = tolerance for execution spread/slippage
         double tol    = ps * 5;
         bool hit_tp   = tp > 0 && MathAbs(cp - tp) <= tol;
         bool hit_sl   = sl > 0 && MathAbs(cp - sl) <= tol;
@@ -513,9 +526,9 @@ void DetectAndReportClosedTrades() {
         if      (hit_tp) reason = "TP";
         else if (hit_sl) reason = "SL";
         string body=StringFormat(
-            "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,"
+            "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,\"profit\":%.2f,"
             "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
-            cp,OrderCommission(),OrderSwap(),reason,FormatISO8601(close_time),AccountEquity());
+            cp,OrderCommission(),OrderSwap(),OrderProfit(),reason,FormatISO8601(close_time),AccountEquity());
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
         StringToCharArray(body,post,0,StringLen(body));
@@ -529,7 +542,6 @@ void DetectAndReportClosedTrades() {
     }
 }
 
-// ── Close All / Protect ───────────────────────────────────────────────
 void CloseAllPositions(string reason) {
     for (int i=OrdersTotal()-1;i>=0;i--) {
         if (!OrderSelect(i,SELECT_BY_POS,MODE_TRADES)) continue;
@@ -561,7 +573,6 @@ void CloseAllPositions(string reason) {
     }
 }
 
-// ── Notify Backend ────────────────────────────────────────────────────
 void NotifyBackend(int ticket,string sym,string dir,
                    double price,double sl,double tp,double lots,
                    double equity,double risk_amt,double atr,

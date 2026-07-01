@@ -107,21 +107,21 @@ async def drawdown_summary(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    now_jst = datetime.now(JST)
-    today = now_jst.date()
+    UTC = timezone.utc
+    today = datetime.now(UTC).date()
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
 
-    def jst_day_start(d: date) -> datetime:
-        return datetime(d.year, d.month, d.day, tzinfo=JST)
+    def utc_day_start(d: date) -> datetime:
+        return datetime(d.year, d.month, d.day, tzinfo=UTC)
 
-    def jst_day_end(d: date) -> datetime:
-        return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=JST)
+    def utc_day_end(d: date) -> datetime:
+        return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=UTC)
 
     async def dd_for_period(start: date) -> float:
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
-            .where(TradeHistory.closed_at >= jst_day_start(start))
+            .where(TradeHistory.closed_at >= utc_day_start(start))
             .where(TradeHistory.net_pnl < 0)
         )
         result = await db.execute(stmt)
@@ -131,8 +131,8 @@ async def drawdown_summary(
     async def pnl_for_day(start: date) -> float:
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
-            .where(TradeHistory.closed_at >= jst_day_start(start))
-            .where(TradeHistory.closed_at <= jst_day_end(start))
+            .where(TradeHistory.closed_at >= utc_day_start(start))
+            .where(TradeHistory.closed_at <= utc_day_end(start))
         )
         result = await db.execute(stmt)
         val = result.scalar()
@@ -141,7 +141,7 @@ async def drawdown_summary(
     async def total_pnl_for_period(start: date) -> float:
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
-            .where(TradeHistory.closed_at >= jst_day_start(start))
+            .where(TradeHistory.closed_at >= utc_day_start(start))
         )
         result = await db.execute(stmt)
         val = result.scalar()

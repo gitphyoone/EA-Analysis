@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
@@ -20,22 +21,19 @@ async def ingest_candle(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    row = MarketData(**payload.model_dump())
-    db.add(row)
-    try:
-        await db.commit()
-        await db.refresh(row)
-    except Exception:
-        await db.rollback()
-        stmt = select(MarketData).where(
-            MarketData.symbol == payload.symbol,
-            MarketData.timeframe == payload.timeframe,
-            MarketData.timestamp == payload.timestamp,
+    data = payload.model_dump()
+    stmt = (
+        pg_insert(MarketData)
+        .values(**data)
+        .on_conflict_do_update(
+            index_elements=["symbol", "timeframe", "timestamp"],
+            set_={k: v for k, v in data.items() if k not in ("symbol", "timeframe", "timestamp")},
         )
-        result = await db.execute(stmt)
-        row = result.scalar_one_or_none()
-        if row is None:
-            raise HTTPException(500, "Failed to upsert candle")
+        .returning(MarketData)
+    )
+    result = await db.execute(stmt)
+    await db.commit()
+    row = result.scalar_one()
     return row
 
 
