@@ -117,6 +117,32 @@ void CleanupLegacyGV(int ticket) {
     if (GlobalVariableCheck(gv)) GlobalVariableDel(gv);
 }
 
+// FIX 30: Original SL distance tracking
+// Key: "SLD_{symbol}_{magic}" — stores ATR-based sl_dist at entry time
+// Problem: after partial close SL moves to +1R, so MathAbs(entry-sl)
+//          returns a tiny value instead of original risk distance,
+//          making r_step calculation wrong and step-trail non-functional.
+// Solution: save original sl_dist in GV at OpenTrade(), read it in
+//           ManageOpenTrades() for all r and step-trail calculations.
+string GV_SLD(string sym) {
+    return "SLD_" + sym + "_" + IntegerToString(Magic_Number);
+}
+void SaveSlDist(string sym, double sl_dist) {
+    GlobalVariableSet(GV_SLD(sym), sl_dist);
+}
+double LoadSlDist(string sym, double fallback) {
+    string gv = GV_SLD(sym);
+    if (GlobalVariableCheck(gv)) {
+        double val = GlobalVariableGet(gv);
+        if (val > 0) return val;
+    }
+    return fallback;  // fallback to current MathAbs(entry-sl) if GV missing
+}
+void ClearSlDist(string sym) {
+    string gv = GV_SLD(sym);
+    if (GlobalVariableCheck(gv)) GlobalVariableDel(gv);
+}
+
 string symbols[];
 int    num_symbols = 0;
 
@@ -364,6 +390,7 @@ void OpenTrade(string sym,string dir,int sc,double rsi,double adx,
     if (ticket<0) { Print("[Executor] OrderSend failed ",sym," err=",GetLastError()); return; }
 
     MarkOpenedSymbol(sym);
+    SaveSlDist(sym, sl_dist);  // FIX 30: save original ATR-based sl_dist for step-trail
     string msg=StringFormat("[Trade OPEN] %s %s | lots=%.2f price=%.5f SL=%.5f TP=%.5f"
                             " (%.1fR) atr=%.5f risk=%.1f%% ticket=%d",
                             dir,sym,lots,price,sl,tp,TP_R_Multiple,atr,Risk_Per_Trade_Pct,ticket);
@@ -379,7 +406,11 @@ void ManageOpenTrades() {
         string sym=OrderSymbol(); int ticket=OrderTicket();
         double cur=(OrderType()==OP_BUY)?MarketInfo(sym,MODE_BID):MarketInfo(sym,MODE_ASK);
         double entry=OrderOpenPrice(), sl=OrderStopLoss();
-        double sl_dist=MathAbs(entry-sl); if(sl_dist==0) continue;
+        double sl_dist_cur=MathAbs(entry-sl); if(sl_dist_cur==0) continue;
+        // FIX 30: use original ATR-based sl_dist for r and step-trail calculations
+        // After partial close SL moves to +1R so MathAbs(entry-sl) becomes tiny,
+        // causing r to be artificially huge and step-trail SL targets to be wrong.
+        double sl_dist=LoadSlDist(sym, sl_dist_cur);
         double r=(OrderType()==OP_BUY)?(cur-entry)/sl_dist:(entry-cur)/sl_dist;
         double ps=(StringFind(sym,"JPY")>=0)?0.01:0.0001;
 
@@ -441,24 +472,37 @@ void ManageOpenTrades() {
         }
 
         if (IsSymbolPartialClosed(sym)&&r>=Partial_Close_At_R) {
-            double r_step=MathFloor(r*2.0)/2.0;
-            if (r_step<Partial_Close_At_R) r_step=Partial_Close_At_R;
-
-            double target_sl=(OrderType()==OP_BUY)
-                              ?entry+(r_step-1.0)*sl_dist
-                              :entry-(r_step-1.0)*sl_dist;
+            // Trail SL = max(R-1 integer step, ATR×1.5 trail)
+            // R-step:  +2R→SL=+1R, +3R→SL=+2R, +4R→SL=+3R ...
+            // ATR trail: cur ± ATR×1.5 (same mult as entry SL)
+            // max()/min() = tighter of two → locks more profit
+            int    r_floor = (int)MathFloor(r);
+            if (r_floor < (int)Partial_Close_At_R) r_floor = (int)Partial_Close_At_R;
+            double step_sl = (OrderType()==OP_BUY)
+                              ? entry + (r_floor - 1) * sl_dist
+                              : entry - (r_floor - 1) * sl_dist;
+            double atr_cur = iATR(sym,60,14,0);
+            double atr_sl  = (atr_cur > 0)
+                              ? ((OrderType()==OP_BUY) ? cur - atr_cur*1.5
+                                                       : cur + atr_cur*1.5)
+                              : step_sl;
+            double target_sl = (OrderType()==OP_BUY)
+                                ? MathMax(step_sl, atr_sl)
+                                : MathMin(step_sl, atr_sl);
             bool should_move=(OrderType()==OP_BUY)?(target_sl>sl):(target_sl<sl||sl==0);
             if (should_move)
                 if (OrderModify(ticket,entry,target_sl,OrderTakeProfit(),0,clrGreen))
-                    if(Debug) Print("[Mgr] 0.5R step-trail ticket=",ticket,
+                    if(Debug) Print("[Mgr] Trail ticket=",ticket,
                                     " r=",DoubleToStr(r,2),
-                                    " step=",DoubleToStr(r_step,1),
+                                    " step_sl=",DoubleToStr(step_sl,5),
+                                    " atr_sl=",DoubleToStr(atr_sl,5),
                                     " → SL=",DoubleToStr(target_sl,5));
 
             double cur_tp=OrderTakeProfit();
+            // TP extend: use r_floor+1 (next integer R level)
             double new_tp=(OrderType()==OP_BUY)
-                          ?entry+(r_step+0.5)*sl_dist
-                          :entry-(r_step+0.5)*sl_dist;
+                          ?entry+(r_floor+1)*sl_dist
+                          :entry-(r_floor+1)*sl_dist;
             bool tp_behind=(OrderType()==OP_BUY)?(cur>=cur_tp-ps):(cur<=cur_tp+ps);
             if (tp_behind&&MathAbs(new_tp-cur_tp)>ps)
                 if (OrderModify(ticket,entry,OrderStopLoss(),new_tp,0,clrBlue))
@@ -510,32 +554,53 @@ void DetectAndReportClosedTrades() {
     for (int i=total-1;i>=0;i--) {
         if (!OrderSelect(i,SELECT_BY_POS,MODE_HISTORY)) continue;
         if (OrderMagicNumber()!=Magic_Number) continue;
-        int ticket=OrderTicket();
+
+        // FIX 31: capture ALL Order*() fields immediately after OrderSelect()
+        // HasOpenPosition() and other helpers call OrderSelect() internally,
+        // which resets the selector state and causes cross-symbol contamination
+        // (e.g. GBPJPY price written as USDJPY exit_price → net_pnl explosion).
+        int      ticket     = OrderTicket();
+        string   sym        = OrderSymbol();
+        double   cp         = OrderClosePrice();
+        double   o_tp       = OrderTakeProfit();
+        double   o_sl       = OrderStopLoss();
+        double   commission = OrderCommission();
+        double   swap_val   = OrderSwap();
+        datetime close_time = OrderCloseTime();
+        // After this point: use captured vars only. No more Order*() calls.
+
         if (IsReportedClosed(ticket)) continue;
-        datetime close_time=OrderCloseTime(); if(close_time==0) continue;
+        if (close_time==0) continue;
         if (TimeCurrent()-close_time>604800) { MarkReportedClosed(ticket); continue; }
-        string sym=OrderSymbol();
-        if (!HasOpenPosition(sym)) { ClearSymbolPartialClosed(sym); ClearOpenedSymbol(sym); }
+
+        if (!HasOpenPosition(sym)) {
+            ClearSymbolPartialClosed(sym);
+            ClearOpenedSymbol(sym);
+            ClearSlDist(sym);
+        }
         CleanupLegacyGV(ticket);
-        double cp=OrderClosePrice(),tp=OrderTakeProfit(),sl=OrderStopLoss();
-        double ps=(StringFind(sym,"JPY")>=0)?0.01:0.0001;
-        double tol    = ps * 5;
-        bool hit_tp   = tp > 0 && MathAbs(cp - tp) <= tol;
-        bool hit_sl   = sl > 0 && MathAbs(cp - sl) <= tol;
+
+        double ps   = (StringFind(sym,"JPY")>=0)?0.01:0.0001;
+        double tol  = ps*5;
+        bool hit_tp = o_tp>0 && MathAbs(cp-o_tp)<=tol;
+        bool hit_sl = o_sl>0 && MathAbs(cp-o_sl)<=tol;
         string reason = "MANUAL";
-        if      (hit_tp) reason = "TP";
-        else if (hit_sl) reason = "SL";
+        if      (hit_tp) reason="TP";
+        else if (hit_sl) reason="SL";
+
         string body=StringFormat(
-            "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,\"profit\":%.2f,"
-            "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
-            cp,OrderCommission(),OrderSwap(),OrderProfit(),reason,FormatISO8601(close_time),AccountEquity());
+            "{"exit_price":%.6f,"commission":%.2f,"swap":%.2f,"
+            ""exit_reason":"%s","closed_at":"%s","account_equity":%.2f}",
+            cp,commission,swap_val,reason,FormatISO8601(close_time),AccountEquity());
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
         StringToCharArray(body,post,0,StringLen(body));
         int res=WebRequest("POST",url,POSTHeaders(),5000,post,result,rh);
         if (res==200||res==404) {
             MarkReportedClosed(ticket);
-            if(Debug) Print("[Executor] Close reported ticket=",ticket," reason=",reason," HTTP=",res);
+            if(Debug) Print("[Executor] Close reported ticket=",ticket,
+                            " sym=",sym," cp=",DoubleToStr(cp,5),
+                            " reason=",reason," HTTP=",res);
         } else {
             if(Debug) Print("[Executor] Close report failed ticket=",ticket," HTTP=",res);
         }

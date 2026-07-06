@@ -952,12 +952,26 @@
             <option>OFF_SESSION</option>
             <option>FRIDAY_CLOSE</option>
           </select>
+          <select id="siglog-per-page" onchange="siglogPerPageChange()">
+            <option value="10">10/page</option>
+            <option value="20" selected>20/page</option>
+            <option value="50">50/page</option>
+            <option value="100">100/page</option>
+          </select>
           <button class="btn" onclick="loadSignalLog()">Load</button>
           <span class="pill" id="siglog-count">—</span>
         </div>
       </div>
       <div id="siglog-cards">
         <div style="color:var(--text-3);font-size:13px">Select period above and click Load</div>
+      </div>
+      <div id="siglog-pagination" style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;margin-top:4px">
+        <span id="siglog-showing" style="font-size:12px;color:var(--text-3)">—</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn" id="siglog-prev" onclick="siglogPage(-1)" disabled>← Prev</button>
+          <span id="siglog-page-info" style="font-size:12px;color:var(--text-2)">—</span>
+          <button class="btn" id="siglog-next" onclick="siglogPage(1)" disabled>Next →</button>
+        </div>
       </div>
     </div>
 
@@ -1676,34 +1690,38 @@ async function loadRejects() {
 }
 
 // ─── Signal Log — card layout (Entry + Reject) ────────────────────────────────
-let _reasonType = "all";
+let _reasonType  = "all";
+let _siglogPage  = 1;
+let _siglogRows  = [];
 
 function setReasonType(btn) {
   _reasonType = btn.dataset.type;
   btn.closest(".type-filter").querySelectorAll(".type-btn").forEach(b => b.classList.toggle("active", b === btn));
 }
 
-async function loadSignalLog() {
-  const days   = document.getElementById("rej-days").value;
-  const reason = document.getElementById("rej-filter-reason").value;
-  const wrap   = document.getElementById("siglog-cards");
-  const pill   = document.getElementById("siglog-count");
+function siglogPage(delta) {
+  const perPage    = parseInt(document.getElementById("siglog-per-page").value);
+  const totalPages = Math.max(1, Math.ceil(_siglogRows.length / perPage));
+  const next       = _siglogPage + delta;
+  if (next >= 1 && next <= totalPages) { _siglogPage = next; renderSignalLogPage(); }
+}
 
-  wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px"><span class="spinner"></span> Loading…</div>`;
-  pill.textContent = "…";
+function siglogPerPageChange() { _siglogPage = 1; renderSignalLogPage(); }
 
-  let url = `/analytics/signal-log?days=${days}&limit=200&type=${_reasonType}`;
-  if (reason) url += `&reason=${encodeURIComponent(reason)}`;
+function renderSignalLogPage() {
+  const perPage    = parseInt(document.getElementById("siglog-per-page").value);
+  const total      = _siglogRows.length;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
+  const start      = (_siglogPage - 1) * perPage;
+  const end        = Math.min(start + perPage, total);
+  const rows       = _siglogRows.slice(start, end);
 
-  const rows = await get(url);
+  document.getElementById("siglog-showing").textContent  = total ? `Showing ${start + 1}–${end} of ${total}` : "No signals";
+  document.getElementById("siglog-page-info").textContent = `Page ${_siglogPage} of ${totalPages}`;
+  document.getElementById("siglog-prev").disabled = _siglogPage <= 1;
+  document.getElementById("siglog-next").disabled = _siglogPage >= totalPages;
 
-  if (!rows) {
-    wrap.innerHTML = `<div style="color:var(--red);font-size:13px">Failed to load data</div>`;
-    pill.textContent = "—";
-    return;
-  }
-
-  pill.textContent = rows.length + (rows.length === 200 ? "+" : "");
+  const wrap = document.getElementById("siglog-cards");
 
   if (!rows.length) {
     wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px">No signals in this period</div>`;
@@ -1747,18 +1765,17 @@ async function loadSignalLog() {
 
   // ── detail cards ────────────────────────────────────────────────
   const cardsHtml = rows.map(r => {
-    const isEntry = r.direction === "BUY" || r.direction === "SELL";
-    const cardCls = isEntry ? "entry" : "reject";
-    const dirCls  = r.direction === "BUY" ? "pos" : r.direction === "SELL" ? "neg" : "warn";
-    const ts      = r.timestamp ? r.timestamp.substring(0,16).replace("T"," ") : "—";
-    const emaGap  = r.ema_gap != null ? (r.ema_gap >= 0 ? "+" : "") + r.ema_gap.toFixed(3) + "%" : "—";
+    const isEntry   = r.direction === "BUY" || r.direction === "SELL";
+    const cardCls   = isEntry ? "entry" : "reject";
+    const dirCls    = r.direction === "BUY" ? "pos" : r.direction === "SELL" ? "neg" : "warn";
+    const ts        = r.timestamp ? r.timestamp.substring(0,16).replace("T"," ") : "—";
+    const emaGap    = r.ema_gap != null ? (r.ema_gap >= 0 ? "+" : "") + r.ema_gap.toFixed(3) + "%" : "—";
     const emaGapCls = r.ema_gap != null && r.ema_gap >= 0 ? "pos" : "neg";
-    const htfTxt  = r.htf_pass === true ? "aligned" : r.htf_pass === false ? "counter" : "—";
-    const htfCls  = r.htf_pass === true ? "pos" : r.htf_pass === false ? "neg" : "";
+    const htfTxt    = r.htf_pass === true ? "aligned" : r.htf_pass === false ? "counter" : "—";
+    const htfCls    = r.htf_pass === true ? "pos" : r.htf_pass === false ? "neg" : "";
     const rejectVal = r.reject_reason
       ? `<span class="reject-tag">${r.reject_reason}</span>`
       : `<span class="muted">—</span>`;
-
     return `<div class="reason-card ${cardCls}">
       <div class="reason-card-header">
         <span class="reason-card-title">${r.symbol} <span class="${dirCls}">${r.direction}</span></span>
@@ -1781,6 +1798,36 @@ async function loadSignalLog() {
   }).join("");
 
   wrap.innerHTML = tableHtml + `<div class="reason-grid">${cardsHtml}</div>`;
+}
+
+async function loadSignalLog() {
+  const days   = document.getElementById("rej-days").value;
+  const reason = document.getElementById("rej-filter-reason").value;
+  const wrap   = document.getElementById("siglog-cards");
+  const pill   = document.getElementById("siglog-count");
+
+  wrap.innerHTML = `<div style="color:var(--text-3);font-size:13px"><span class="spinner"></span> Loading…</div>`;
+  pill.textContent = "…";
+  document.getElementById("siglog-showing").textContent  = "—";
+  document.getElementById("siglog-page-info").textContent = "—";
+  document.getElementById("siglog-prev").disabled = true;
+  document.getElementById("siglog-next").disabled = true;
+
+  let url = `/analytics/signal-log?days=${days}&limit=500&type=${_reasonType}`;
+  if (reason) url += `&reason=${encodeURIComponent(reason)}`;
+
+  const rows = await get(url);
+
+  if (!rows) {
+    wrap.innerHTML = `<div style="color:var(--red);font-size:13px">Failed to load data</div>`;
+    pill.textContent = "—";
+    return;
+  }
+
+  _siglogRows = rows;
+  _siglogPage = 1;
+  pill.textContent = rows.length + (rows.length >= 500 ? "+" : "");
+  renderSignalLogPage();
 }
 
 // ─── Init ──────────────────────────────────────────────────────────────────────

@@ -135,6 +135,10 @@ string FormatTimestamp(datetime dt) {
     return s;
 }
 string FormatISO8601(datetime dt) { return FormatTimestamp(dt); }
+// Broker server time != UTC — convert before reporting closed_at (see mt4/TradeExecutor.mq4).
+datetime ServerToGMT(datetime server_time) {
+    return server_time + (TimeGMT() - TimeCurrent());
+}
 
 string TodayString() {
     MqlDateTime tm;
@@ -722,7 +726,7 @@ void DetectAndReportClosedTrades() {
             "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,\"profit\":%.2f,"
             "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
             last_price, total_commission, total_swap, total_profit,
-            reason, FormatISO8601(last_time), AccountInfoDouble(ACCOUNT_EQUITY));
+            reason, FormatISO8601(ServerToGMT(last_time)), AccountInfoDouble(ACCOUNT_EQUITY));
 
         string url = FastAPI_Base + "/trades/close/by-ticket/" + IntegerToString((long)pos_id);
         uchar post_data[], result[]; string rh;
