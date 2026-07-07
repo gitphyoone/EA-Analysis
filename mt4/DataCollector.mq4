@@ -8,7 +8,7 @@
 input string FastAPI_URL        = "http://127.0.0.1/data/candle";
 input string FastAPI_AccountURL = "http://127.0.0.1/data/account";
 input string API_Key            = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string Symbol_List        = "EURUSD,GBPUSD,USDJPY.y,AUDUSD,USDCAD,GBPJPY";
+input string Symbol_List        = "EURUSD,GBPUSD,USDJPY.y,AUDUSD,USDCAD,GBPJPY,EURJPY";
 input int    Timeframe          = 60;
 input int    CollectOnTick      = 1;
 input bool   Debug              = true;
