@@ -8,6 +8,11 @@ Fixes applied:
   - FIX: Optional multi-timeframe bias — pass H4/D1 trend direction to filter counter-trend entries
   - FIX: EMA10/20 short-term alignment (Option B score-based) — misalignment costs 1 point
          but does NOT hard-reject; strong setups (7/8) still trade through it
+  - FIX: EMA50/200 slope filter — EMAs must be rising (BUY) or falling (SELL)
+         prevents entries when trend is flattening or reversing at peak/trough
+  - FIX: Dynamic score threshold — strong ADX (> adx_strong_threshold) lowers
+         required score from 7 to 6, allowing high-conviction entries through
+         even when one minor condition (e.g. EMA slope lag) is borderline
 Original (kept): EMA50/200 cross + RSI + ADX + DI+/DI- + ATR minimum
 """
 from decimal import Decimal
@@ -38,6 +43,8 @@ class SignalEngine:
         htf_trend_up: Optional[bool] = None,     # FIX: H4/D1 trend bias (None = not checked)
         ema10: Optional[Decimal] = None,          # FIX: EMA10 for short-term alignment score
         ema20: Optional[Decimal] = None,          # FIX: EMA20 for short-term alignment score
+        ema50_prev: Optional[Decimal] = None,     # FIX: EMA50 bar[2] for slope detection
+        ema200_prev: Optional[Decimal] = None,    # FIX: EMA200 bar[2] for slope detection
     ) -> SignalResult:
         cfg = self.settings
 
@@ -110,12 +117,38 @@ class SignalEngine:
             ema_short_ok = None
             ema_short_score = 1   # no data — no penalty
 
+        # ── EMA Slope filter (score-based) ───────────────────────────
+        # EMA50/200 must be rising for BUY, falling for SELL.
+        # Prevents entries when trend is flattening at peak/trough.
+        # Uses bar[2] (prev) vs bar[1] (current) slope.
+        # None if prev values not provided → no penalty (backward compat)
+        if ema50_prev is not None and ema200_prev is not None:
+            ema50_rising  = float(ema50)  > float(ema50_prev)
+            ema200_rising = float(ema200) > float(ema200_prev)
+            if trend_up:
+                # BUY: both EMAs should be rising
+                ema_slope_ok: Optional[bool] = ema50_rising and ema200_rising
+            elif trend_down:
+                # SELL: both EMAs should be falling
+                ema_slope_ok = (not ema50_rising) and (not ema200_rising)
+            else:
+                ema_slope_ok = False
+            ema_slope_score = int(ema_slope_ok)
+        else:
+            ema_slope_ok = None
+            ema_slope_score = 1   # no data — no penalty
+
         # ── Score system ──────────────────────────────────────────────
-        # 8 components (DI excluded); need 7/8 to trade (was 6/7).
-        # Allows 1 weaker condition without blocking (1 miss = still trades).
+        # 9 components (DI excluded); base required = 7/9
+        # Dynamic threshold: strong ADX lowers required to 6/9
+        #   → high-conviction momentum entries still trade through
+        #     even when one minor condition (e.g. slope lag) is borderline
         score = sum([int(ema_trend), int(regime_ok), int(body_ok), htf_score,
-                     int(rsi_ok), int(adx_ok), int(atr_ok), ema_short_score])
-        _required = 7
+                     int(rsi_ok), int(adx_ok), int(atr_ok),
+                     ema_short_score, ema_slope_score])
+
+        # Dynamic threshold: relax by 1 when ADX confirms strong trend
+        _required = 6 if adx_val > cfg.adx_strong_threshold else 7
 
         if trend_up and score >= _required:
             direction: SignalDirection = "BUY"
@@ -127,7 +160,7 @@ class SignalEngine:
             direction = "NO_TRADE"
             reject_reason = self._reject_reason(
                 trend_up, trend_down, regime_ok, body_ok, htf_score,
-                rsi_ok, adx_ok, atr_ok, ema_short_ok
+                rsi_ok, adx_ok, atr_ok, ema_short_ok, ema_slope_ok
             )
 
         return SignalResult(
@@ -165,8 +198,9 @@ class SignalEngine:
         adx_ok: bool,
         atr_ok: bool,
         ema_short_ok: Optional[bool],
+        ema_slope_ok: Optional[bool],
     ) -> RejectReason:
-        # Score < 7 means 2+ conditions failed. Report highest-priority failure.
+        # Score < required means 2+ conditions failed. Report highest-priority failure.
         if not (trend_up or trend_down):
             return "NO_TREND"
         if not regime_ok:
@@ -179,6 +213,8 @@ class SignalEngine:
             return "RSI_OUT_OF_RANGE"
         if not atr_ok:
             return "ATR_TOO_LOW"
+        if ema_slope_ok is False:
+            return "EMA_SLOPE_FLAT"
         if ema_short_ok is False:
             return "EMA_SHORT_COUNTER"
         if htf_score == 0:

@@ -93,10 +93,14 @@ void CollectAndSend(string sym, datetime ts) {
 
     // Indicators — bar 1 = closed, confirmed
     // FIX: ema10/ema20 added for EMA_SHORT_COUNTER filter in signal engine
-    double ema10  = iMA(sym, Timeframe,  10, 0, MODE_EMA, PRICE_CLOSE, 1);
-    double ema20  = iMA(sym, Timeframe,  20, 0, MODE_EMA, PRICE_CLOSE, 1);
-    double ema50  = iMA(sym, Timeframe,  50, 0, MODE_EMA, PRICE_CLOSE, 1);
-    double ema200 = iMA(sym, Timeframe, 200, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double ema10       = iMA(sym, Timeframe,  10, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double ema20       = iMA(sym, Timeframe,  20, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double ema50       = iMA(sym, Timeframe,  50, 0, MODE_EMA, PRICE_CLOSE, 1);
+    double ema200      = iMA(sym, Timeframe, 200, 0, MODE_EMA, PRICE_CLOSE, 1);
+    // FIX: ema50_prev/ema200_prev (bar 2) for EMA slope filter in signal engine
+    // slope = ema50(bar1) > ema50(bar2) → rising; else falling
+    double ema50_prev  = iMA(sym, Timeframe,  50, 0, MODE_EMA, PRICE_CLOSE, 2);
+    double ema200_prev = iMA(sym, Timeframe, 200, 0, MODE_EMA, PRICE_CLOSE, 2);
     double rsi    = iRSI(sym, Timeframe, 14, PRICE_CLOSE, 1);
     double adx    = iADX(sym, Timeframe, 14, PRICE_CLOSE, MODE_MAIN,    1);
     double di_p   = iADX(sym, Timeframe, 14, PRICE_CLOSE, MODE_PLUSDI,  1);
@@ -118,6 +122,8 @@ void CollectAndSend(string sym, datetime ts) {
         "\"ema20\":%.6f,"
         "\"ema50\":%.6f,"
         "\"ema200\":%.6f,"
+        "\"ema50_prev\":%.6f,"
+        "\"ema200_prev\":%.6f,"
         "\"rsi14\":%.4f,"
         "\"adx14\":%.4f,"
         "\"di_plus\":%.4f,"
@@ -128,6 +134,7 @@ void CollectAndSend(string sym, datetime ts) {
         FormatTimestamp(iTime(sym, Timeframe, 1)),
         o, h, l, c, v,
         ema10, ema20, ema50, ema200,
+        ema50_prev, ema200_prev,
         rsi, adx, di_p, di_m, atr
     );
 
@@ -146,7 +153,9 @@ void CollectAndSend(string sym, datetime ts) {
             Print("[DataCollector] OK ", sym, " | ",
                   FormatTimestamp(iTime(sym, Timeframe, 1)),
                   " ema10=", DoubleToStr(ema10,5),
-                  " ema20=", DoubleToStr(ema20,5));
+                  " ema20=", DoubleToStr(ema20,5),
+                  " ema50_slope=", DoubleToStr(ema50-ema50_prev,6),
+                  " ema200_slope=", DoubleToStr(ema200-ema200_prev,6));
         else
             Print("[DataCollector] FAIL ", sym, " HTTP=", res,
                   " body=", CharArrayToString(result));

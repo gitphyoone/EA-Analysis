@@ -13,6 +13,7 @@ RejectReason = Literal[
     "ADX_WEAK",             # ADX below minimum — trend not strong enough
     "RSI_OUT_OF_RANGE",     # RSI outside buy/sell window for this direction
     "ATR_TOO_LOW",          # ATR below minimum — insufficient volatility
+    "EMA_SLOPE_FLAT",       # EMA50/200 slope disagreement — trend losing momentum
     "EMA_SHORT_COUNTER",    # EMA10/20 counter to H1 trend — bounce entry risk
     "HTF_COUNTER_TREND",    # H4/D1 trend opposes entry direction
     "MULTI_CONDITION_FAIL", # 2+ conditions failed — no single dominant reason
