@@ -118,12 +118,17 @@ async def drawdown_summary(
     def utc_day_end(d: date) -> datetime:
         return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=UTC)
 
-    async def dd_for_period(start: date) -> float:
+    async def dd_for_period(start: date, end: date = None) -> float:
+        # FIX: daily_loss was returning 0 because no end-date bound was set.
+        # Without end=today, the query spans from 'start' to now (all-time for daily).
+        # Pass end=today to correctly bound today-only losses.
         stmt = (
             select(func.sum(TradeHistory.net_pnl))
             .where(TradeHistory.closed_at >= utc_day_start(start))
             .where(TradeHistory.net_pnl < 0)
         )
+        if end is not None:
+            stmt = stmt.where(TradeHistory.closed_at <= utc_day_end(end))
         result = await db.execute(stmt)
         val = result.scalar()
         return float(val or 0)
@@ -147,7 +152,7 @@ async def drawdown_summary(
         val = result.scalar()
         return float(val or 0)
 
-    daily_loss = await dd_for_period(today)
+    daily_loss = await dd_for_period(today, today)   # FIX: bound to today only
     weekly_loss = await dd_for_period(week_start)
     monthly_loss = await dd_for_period(month_start)
     daily_pnl = await pnl_for_day(today)

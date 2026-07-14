@@ -49,8 +49,8 @@
 // Inputs
 input string FastAPI_Base           = "http://127.0.0.1";
 input string API_Key                = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string Symbol_List            = "EURUSD,GBPUSD,USDJPY.y,AUDUSD,USDCAD,GBPJPY,EURJPY";
-input int    Poll_Seconds           = 60;
+input string Symbol_List            = "EURUSD,GBPUSD,USDJPY.y,AUDUSD,USDCAD,GBPJPY";
+input int    Poll_Seconds           = 10;
 input int    Magic_Number           = 19001;
 input int    Slippage               = 3;
 input bool   Enable_Trading         = true;
@@ -66,9 +66,10 @@ input double Risk_Per_Trade_Pct     = 1.0;
 input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
-input double TP_R_Multiple          = 3.0;
-input double Partial_Close_At_R     = 2.0;
-input double Partial_Close_Ratio    = 0.30;
+input double TP_R_Multiple          = 3.0;   // TP = SL_dist x R
+input double SL_ATR_Mult            = 2.0;   // SL = ATR x mult (H1=1.5, H4=2.0)
+input double Partial_Close_At_R     = 4.0;   // partial trigger (H1=2.0, H4=4.0)
+input double Partial_Close_Ratio    = 0.30;  // 30% close at partial trigger
 
 input double CB_Level1_DD_Pct       = 3.0;
 input double CB_Level2_DD_Pct       = 5.0;
@@ -234,14 +235,30 @@ int OnInit() {
     for (int j=0;j<ArraySize(g_opened_symbols);j++) g_opened_symbols[j]="";
     EventSetTimer(Poll_Seconds);
     Print("[Executor v2.10] Initialized"
-          " | symbols=",Symbol_List," | magic=",Magic_Number,
-          " | max_pos=",Max_Open_Positions," | portfolio=",Portfolio_Max_Risk_Pct,"%"
-          " | risk=",Risk_Per_Trade_Pct,"% | TP=",TP_R_Multiple,"R"
-          " | partial=",Partial_Close_Ratio*100,"% @+",Partial_Close_At_R,"R"
-          " | 0.5R step-trail | CB_reset=",CB_Reset_Ratio);
+          " | symbols=",Symbol_List,
+          " | magic=",Magic_Number,
+          " | max_pos=",Max_Open_Positions,
+          " | portfolio=",Portfolio_Max_Risk_Pct,
+          " | risk=",Risk_Per_Trade_Pct,
+          " | TP=",TP_R_Multiple,"R",
+          " | SL_mult=",SL_ATR_Mult,
+          " | partial=",Partial_Close_Ratio*100," @+",Partial_Close_At_R,"R",
+          " | prod-exit | CB_reset=",CB_Reset_Ratio);
     return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason) { EventKillTimer(); }
+
+// FIX 32: ManageOpenTrades() moved to OnTick() for real-time price tracking
+// BE, partial close, trailing stop must react immediately to price movement.
+// 60-second poll was too slow — TP could be hit before partial close fired.
+// OnTimer() handles: DetectAndReportClosedTrades, CheckCircuitBreaker, EvaluateSignals
+// OnTick()  handles: ManageOpenTrades (price-sensitive, needs tick-level response)
+void OnTick() {
+    if (!Enable_Trading) return;
+    if (cb_level == 3) return;
+    ManageOpenTrades();
+    if (cb_level == 2) Level2ProtectTrades();
+}
 
 void OnTimer() {
     string today=TodayString();
@@ -250,9 +267,6 @@ void OnTimer() {
     if (!Enable_Trading) return;
     if (IsFridayClose()) { CloseAllPositions("FRIDAY_CLOSE"); return; }
     CheckCircuitBreaker();
-    if (cb_level==3) return;
-    ManageOpenTrades();
-    if (cb_level==2) { Level2ProtectTrades(); return; }
     if (cb_level>=1) return;
     EvaluateSignals();
 }
@@ -369,7 +383,7 @@ void OpenTrade(string sym,string dir,int sc,double rsi,double adx,
     if (dir=="BUY") { price=MarketInfo(sym,MODE_ASK); cmd=OP_BUY; }
     else            { price=MarketInfo(sym,MODE_BID); cmd=OP_SELL; }
 
-    double sl_dist=atr*1.5;
+    double sl_dist=atr*SL_ATR_Mult;  // FIX: dynamic SL multiplier (H1=1.5, H4=2.0)
     double sl=(cmd==OP_BUY)?price-sl_dist:price+sl_dist;
     double tp=(cmd==OP_BUY)?price+sl_dist*TP_R_Multiple:price-sl_dist*TP_R_Multiple;
 
@@ -472,23 +486,63 @@ void ManageOpenTrades() {
         }
 
         if (IsSymbolPartialClosed(sym)&&r>=Partial_Close_At_R) {
-            // Trail SL = max(R-1 integer step, ATR×1.5 trail)
-            // R-step:  +2R→SL=+1R, +3R→SL=+2R, +4R→SL=+3R ...
-            // ATR trail: cur ± ATR×1.5 (same mult as entry SL)
-            // max()/min() = tighter of two → locks more profit
-            int    r_floor = (int)MathFloor(r);
-            if (r_floor < (int)Partial_Close_At_R) r_floor = (int)Partial_Close_At_R;
-            double step_sl = (OrderType()==OP_BUY)
-                              ? entry + (r_floor - 1) * sl_dist
-                              : entry - (r_floor - 1) * sl_dist;
             double atr_cur = iATR(sym,60,14,0);
-            double atr_sl  = (atr_cur > 0)
-                              ? ((OrderType()==OP_BUY) ? cur - atr_cur*1.5
-                                                       : cur + atr_cur*1.5)
-                              : step_sl;
+
+            // ── Trend strength indicators ────────────────────────────
+            double adx_cur  = iADX(sym,60,14,PRICE_CLOSE,MODE_MAIN,0);
+            double adx_prev = iADX(sym,60,14,PRICE_CLOSE,MODE_MAIN,3);
+            double ema10_cur = iMA(sym,60,10,0,MODE_EMA,PRICE_CLOSE,0);
+            double ema20_cur = iMA(sym,60,20,0,MODE_EMA,PRICE_CLOSE,0);
+            double ema10_prev= iMA(sym,60,10,0,MODE_EMA,PRICE_CLOSE,1);
+            double ema20_prev= iMA(sym,60,20,0,MODE_EMA,PRICE_CLOSE,1);
+
+            // EMA10/20 cross-back detection
+            // BUY: ema10 was above ema20, now crossed below → momentum lost
+            bool ema_cross_back = false;
+            if (OrderType()==OP_BUY)
+                ema_cross_back = (ema10_prev >= ema20_prev) && (ema10_cur < ema20_cur);
+            else
+                ema_cross_back = (ema10_prev <= ema20_prev) && (ema10_cur > ema20_cur);
+
+            bool adx_weak    = adx_cur < 25.0;
+            bool adx_dying   = adx_cur < 20.0;
+
+            // ── Production Grade Exit Logic ──────────────────────────
+            // Case 1: ADX<20 AND EMA cross-back → Runner Full Close
+            if (adx_dying && ema_cross_back && r >= 3.0) {
+                bool ok = OrderClose(ticket, OrderLots(), cur, Slippage, clrRed);
+                if (ok) {
+                    string msg=StringFormat("[Mgr] RUNNER CLOSE ticket=%d %s"
+                        " r=%.2f ADX=%.1f EMA-crossback → trend ended",
+                        ticket, sym, r, adx_cur);
+                    if(Debug) Print(msg); SendTelegram(msg);
+                }
+                continue;
+            }
+
+            // Case 2: ADX<25 OR EMA cross-back → Tighten to ATR×0.5
+            double atr_mult = SL_ATR_Mult;  // default (1.5 or 2.0)
+            if (adx_weak || ema_cross_back) {
+                atr_mult = 0.5;  // tighten — trend weakening
+                if(Debug) Print("[Mgr] Tighten ATR×0.5 ticket=",ticket,
+                                " ADX=",DoubleToStr(adx_cur,1),
+                                " cross_back=",ema_cross_back);
+            }
+
+            // ── SL = max(CurrentR-1, ATR trail) ─────────────────────
+            int    r_floor  = (int)MathFloor(r);
+            if (r_floor < (int)Partial_Close_At_R) r_floor = (int)Partial_Close_At_R;
+            double step_sl  = (OrderType()==OP_BUY)
+                               ? entry + (r_floor - 1) * sl_dist
+                               : entry - (r_floor - 1) * sl_dist;
+            double atr_sl   = (atr_cur > 0)
+                               ? ((OrderType()==OP_BUY) ? cur - atr_cur * atr_mult
+                                                        : cur + atr_cur * atr_mult)
+                               : step_sl;
             double target_sl = (OrderType()==OP_BUY)
                                 ? MathMax(step_sl, atr_sl)
                                 : MathMin(step_sl, atr_sl);
+
             bool should_move=(OrderType()==OP_BUY)?(target_sl>sl):(target_sl<sl||sl==0);
             if (should_move)
                 if (OrderModify(ticket,entry,target_sl,OrderTakeProfit(),0,clrGreen))
@@ -496,15 +550,16 @@ void ManageOpenTrades() {
                                     " r=",DoubleToStr(r,2),
                                     " step_sl=",DoubleToStr(step_sl,5),
                                     " atr_sl=",DoubleToStr(atr_sl,5),
+                                    " mult=",DoubleToStr(atr_mult,1),
                                     " → SL=",DoubleToStr(target_sl,5));
 
-            double cur_tp=OrderTakeProfit();
-            // TP extend: use r_floor+1 (next integer R level)
-            double new_tp=(OrderType()==OP_BUY)
-                          ?entry+(r_floor+1)*sl_dist
-                          :entry-(r_floor+1)*sl_dist;
-            bool tp_behind=(OrderType()==OP_BUY)?(cur>=cur_tp-ps):(cur<=cur_tp+ps);
-            if (tp_behind&&MathAbs(new_tp-cur_tp)>ps)
+            // ── TP extend ────────────────────────────────────────────
+            double cur_tp = OrderTakeProfit();
+            double new_tp = (OrderType()==OP_BUY)
+                             ? entry + (r_floor + 1) * sl_dist
+                             : entry - (r_floor + 1) * sl_dist;
+            bool tp_behind = (OrderType()==OP_BUY)?(cur>=cur_tp-ps):(cur<=cur_tp+ps);
+            if (tp_behind && MathAbs(new_tp-cur_tp) > ps)
                 if (OrderModify(ticket,entry,OrderStopLoss(),new_tp,0,clrBlue))
                     if(Debug) Print("[Mgr] TP extended ticket=",ticket,
                                     " new_tp=",DoubleToStr(new_tp,5));
@@ -589,8 +644,8 @@ void DetectAndReportClosedTrades() {
         else if (hit_sl) reason="SL";
 
         string body=StringFormat(
-            "{"exit_price":%.6f,"commission":%.2f,"swap":%.2f,"
-            ""exit_reason":"%s","closed_at":"%s","account_equity":%.2f}",
+            "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,"
+            "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
             cp,commission,swap_val,reason,FormatISO8601(close_time),AccountEquity());
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
