@@ -66,7 +66,7 @@ input double Risk_Per_Trade_Pct     = 1.0;
 input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
-input double TP_R_Multiple          = 3.0;   // TP = SL_dist x R
+input double TP_R_Multiple          = 8.0;   // TP = SL_dist x R
 input double SL_ATR_Mult            = 2.0;   // SL = ATR x mult (H1=1.5, H4=2.0)
 input double Partial_Close_At_R     = 4.0;   // partial trigger (H1=2.0, H4=4.0)
 input double Partial_Close_Ratio    = 0.30;  // 30% close at partial trigger
