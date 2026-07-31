@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT5 Trade Executor v1.00                     |
+//| V19 FX Prop Desk — MT5 Trade Executor v1.11                     |
 //| Ported from MT4 TradeExecutor v2.10                             |
 //|                                                                  |
 //| MQL4→MQL5 key changes:                                          |
@@ -12,15 +12,38 @@
 //|  - Partial close: same ticket survives (no remainder ticket)    |
 //|  - DEAL_REASON_SL/TP for exit reason (cleaner than price cmp)  |
 //|  - ulong tickets (64-bit)                                       |
+//| v1.10 — synced with MT4 v2.10:                                  |
+//|  - ManageOpenTrades moved OnTimer → OnTick (real-time reaction) |
+//|  - SL_ATR_Mult input; TP/partial-trigger R defaults raised      |
+//|  - ADX/EMA10-20 trend-weakening exit: tighten to ATR×0.5, or   |
+//|    full "runner" close when ADX<20 + EMA cross-back at ≥3R    |
+//|  - SLD global-var tracks original ATR-based sl_dist (needed    |
+//|    because BE/partial close moves the position's actual SL,    |
+//|    which would otherwise corrupt R and step-trail math)        |
+//| v1.11 — MT4/MT5 logic-parity fixes:                             |
+//|  - FIX A: ServerToGMT() header comment corrected — it wrongly   |
+//|    claimed MT4 (v2.10) already converts closed_at to GMT.       |
+//|    It does NOT; MT4 sends raw broker-server time. This is a     |
+//|    separate, still-open bug to fix on the MT4 side — do not     |
+//|    assume it's handled there. MT5's ServerToGMT() conversion    |
+//|    itself is correct and unchanged.                             |
+//|  - FIX B: CloseAllPositions() ATR shift corrected from the      |
+//|    GetATR() default (shift=1, previous closed bar) to an        |
+//|    explicit shift=0 (current/live bar), matching MT4's          |
+//|    iATR(sym,60,14,0) in the same function.                      |
+//|  - NOTE (not fixed here, unconfirmed): Symbol_List uses plain   |
+//|    "USDJPY" while MT4 uses "USDJPY.y" (broker suffix). Verify   |
+//|    against this MT5 account's actual Market Watch symbol name   |
+//|    before relying on USDJPY signals/trades.                     |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.00"
+#property version   "1.11"
 
 // ── Inputs ──────────────────────────────────────────────────────────
 input string FastAPI_Base           = "http://127.0.0.1";
 input string API_Key                = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string Symbol_List            = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,EURJPY";
-input int    Poll_Seconds           = 60;
+input string Symbol_List            = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY";
+input int    Poll_Seconds           = 10;
 input long   Magic_Number           = 19001;
 input int    Slippage               = 3;
 input bool   Enable_Trading         = true;
@@ -36,9 +59,10 @@ input double Risk_Per_Trade_Pct     = 1.0;
 input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
-input double TP_R_Multiple          = 3.0;
-input double Partial_Close_At_R     = 2.0;
-input double Partial_Close_Ratio    = 0.30;
+input double TP_R_Multiple          = 8.0;   // TP = SL_dist x R
+input double SL_ATR_Mult            = 2.0;   // SL = ATR x mult (H1=1.5, H4=2.0)
+input double Partial_Close_At_R     = 4.0;   // partial trigger (H1=2.0, H4=4.0)
+input double Partial_Close_Ratio    = 0.30;  // 30% close at partial trigger
 
 input double CB_Level1_DD_Pct       = 3.0;
 input double CB_Level2_DD_Pct       = 5.0;
@@ -58,6 +82,9 @@ int    g_opened_count = 0;
 string symbols[];
 int    num_symbols = 0;
 int    atr_handles[];   // one per symbol, created in OnInit
+int    adx_handles[];   // ADX(14) main line, one per symbol
+int    ma10_handles[];  // EMA(10) close, one per symbol
+int    ma20_handles[];  // EMA(20) close, one per symbol
 
 // ── Utility helpers ──────────────────────────────────────────────────
 bool IsOpenedSymbol(string sym) {
@@ -88,17 +115,48 @@ void ClearSymbolPartialClosed(string sym) {
     if (GlobalVariableCheck(GV_PC(sym))) GlobalVariableDel(GV_PC(sym));
 }
 
+// Original ATR-based SL distance at entry (see header note — required so
+// r/step-trail math stays correct after BE or partial close moves the SL).
+string GV_SLD(string sym) { return "SLD_" + sym + "_" + IntegerToString(Magic_Number); }
+void SaveSlDist(string sym, double sl_dist) { GlobalVariableSet(GV_SLD(sym), sl_dist); }
+double LoadSlDist(string sym, double fallback) {
+    string gv = GV_SLD(sym);
+    if (GlobalVariableCheck(gv)) {
+        double val = GlobalVariableGet(gv);
+        if (val > 0) return val;
+    }
+    return fallback;
+}
+void ClearSlDist(string sym) {
+    string gv = GV_SLD(sym);
+    if (GlobalVariableCheck(gv)) GlobalVariableDel(gv);
+}
+
 // ── Indicator helpers ─────────────────────────────────────────────────
 int SymbolIndex(string sym) {
     for (int i = 0; i < num_symbols; i++)
         if (symbols[i] == sym) return i;
     return -1;
 }
-double GetATR(string sym) {
+double GetATR(string sym, int shift = 1) {
     int idx = SymbolIndex(sym);
     if (idx < 0 || atr_handles[idx] == INVALID_HANDLE) return 0.0;
     double buf[1];
-    if (CopyBuffer(atr_handles[idx], 0, 1, 1, buf) != 1) return 0.0;
+    if (CopyBuffer(atr_handles[idx], 0, shift, 1, buf) != 1) return 0.0;
+    return buf[0];
+}
+double GetADX(string sym, int shift) {
+    int idx = SymbolIndex(sym);
+    if (idx < 0 || adx_handles[idx] == INVALID_HANDLE) return 0.0;
+    double buf[1];
+    if (CopyBuffer(adx_handles[idx], 0, shift, 1, buf) != 1) return 0.0;
+    return buf[0];
+}
+double GetMA(int &handles[], string sym, int shift) {
+    int idx = SymbolIndex(sym);
+    if (idx < 0 || handles[idx] == INVALID_HANDLE) return 0.0;
+    double buf[1];
+    if (CopyBuffer(handles[idx], 0, shift, 1, buf) != 1) return 0.0;
     return buf[0];
 }
 
@@ -135,7 +193,11 @@ string FormatTimestamp(datetime dt) {
     return s;
 }
 string FormatISO8601(datetime dt) { return FormatTimestamp(dt); }
-// Broker server time != UTC — convert before reporting closed_at (see mt4/TradeExecutor.mq4).
+// Broker server time != UTC — convert before reporting closed_at.
+// NOTE (v1.11): MT4 executor (v2.10) does NOT do this conversion yet — that's
+// a separate, still-open bug on the MT4 side. Do not assume it's handled
+// there; this MT5 conversion is correct and should NOT be removed to
+// "match" MT4 — fix MT4 to match this instead.
 datetime ServerToGMT(datetime server_time) {
     return server_time + (TimeGMT() - TimeCurrent());
 }
@@ -252,27 +314,50 @@ int OnInit() {
     g_opened_count = 0;
     for (int j = 0; j < ArraySize(g_opened_symbols); j++) g_opened_symbols[j] = "";
 
-    // Create ATR handles for each symbol
+    // Create indicator handles for each symbol
     ArrayResize(atr_handles, num_symbols);
+    ArrayResize(adx_handles, num_symbols);
+    ArrayResize(ma10_handles, num_symbols);
+    ArrayResize(ma20_handles, num_symbols);
     for (int i = 0; i < num_symbols; i++) {
-        atr_handles[i] = iATR(symbols[i], PERIOD_H1, 14);
-        if (atr_handles[i] == INVALID_HANDLE)
-            Print("[Executor] WARNING: ATR handle failed for ", symbols[i]);
+        atr_handles[i]  = iATR(symbols[i], PERIOD_H1, 14);
+        adx_handles[i]  = iADX(symbols[i], PERIOD_H1, 14);
+        ma10_handles[i] = iMA(symbols[i], PERIOD_H1, 10, 0, MODE_EMA, PRICE_CLOSE);
+        ma20_handles[i] = iMA(symbols[i], PERIOD_H1, 20, 0, MODE_EMA, PRICE_CLOSE);
+        if (atr_handles[i] == INVALID_HANDLE || adx_handles[i] == INVALID_HANDLE ||
+            ma10_handles[i] == INVALID_HANDLE || ma20_handles[i] == INVALID_HANDLE)
+            Print("[Executor] WARNING: indicator handle failed for ", symbols[i]);
     }
 
     EventSetTimer(Poll_Seconds);
-    Print("[Executor MT5 v1.00] Initialized"
+    Print("[Executor MT5 v1.11] Initialized"
           " | symbols=", Symbol_List, " | magic=", Magic_Number,
           " | max_pos=", Max_Open_Positions, " | portfolio=", Portfolio_Max_Risk_Pct, "%"
           " | risk=", Risk_Per_Trade_Pct, "% | TP=", TP_R_Multiple, "R"
+          " | SL_mult=", SL_ATR_Mult,
           " | partial=", Partial_Close_Ratio*100, "% @+", Partial_Close_At_R, "R"
           " | CB_reset=", CB_Reset_Ratio);
     return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason) {
     EventKillTimer();
-    for (int i = 0; i < num_symbols; i++)
-        if (atr_handles[i] != INVALID_HANDLE) IndicatorRelease(atr_handles[i]);
+    for (int i = 0; i < num_symbols; i++) {
+        if (atr_handles[i]  != INVALID_HANDLE) IndicatorRelease(atr_handles[i]);
+        if (adx_handles[i]  != INVALID_HANDLE) IndicatorRelease(adx_handles[i]);
+        if (ma10_handles[i] != INVALID_HANDLE) IndicatorRelease(ma10_handles[i]);
+        if (ma20_handles[i] != INVALID_HANDLE) IndicatorRelease(ma20_handles[i]);
+    }
+}
+
+// ManageOpenTrades() runs on every tick for real-time price reaction — BE,
+// partial close, and trailing stop must not wait for the Poll_Seconds timer.
+// OnTimer() still handles the poll-cadence work: closed-trade reporting,
+// circuit breaker, and signal evaluation.
+void OnTick() {
+    if (!Enable_Trading) return;
+    if (cb_level == 3) return;
+    ManageOpenTrades();
+    if (cb_level == 2) Level2ProtectTrades();
 }
 
 // ── OnTimer (main loop) ───────────────────────────────────────────────
@@ -283,9 +368,6 @@ void OnTimer() {
     if (!Enable_Trading) return;
     if (IsFridayClose()) { CloseAllPositions("FRIDAY_CLOSE"); return; }
     CheckCircuitBreaker();
-    if (cb_level == 3) return;
-    ManageOpenTrades();
-    if (cb_level == 2) { Level2ProtectTrades(); return; }
     if (cb_level >= 1) return;
     EvaluateSignals();
 }
@@ -409,7 +491,7 @@ void OpenTrade(string sym, string dir, int sc, double rsi, double adx,
     if (dir == "BUY") { price = SymbolInfoDouble(sym, SYMBOL_ASK); cmd = ORDER_TYPE_BUY; }
     else              { price = SymbolInfoDouble(sym, SYMBOL_BID);  cmd = ORDER_TYPE_SELL; }
 
-    double sl_dist = atr * 1.5;
+    double sl_dist = atr * SL_ATR_Mult;
     double sl = (cmd == ORDER_TYPE_BUY) ? price - sl_dist : price + sl_dist;
     double tp = (cmd == ORDER_TYPE_BUY) ? price + sl_dist * TP_R_Multiple
                                         : price - sl_dist * TP_R_Multiple;
@@ -451,6 +533,7 @@ void OpenTrade(string sym, string dir, int sc, double rsi, double adx,
 
     ulong ticket = res.order; // position ticket = opening order ticket
     MarkOpenedSymbol(sym);
+    SaveSlDist(sym, sl_dist);
 
     string msg = StringFormat("[Trade OPEN] %s %s | lots=%.2f price=%.5f SL=%.5f TP=%.5f"
                               " (%.1fR) atr=%.5f risk=%.1f%% ticket=%lld",
@@ -477,8 +560,9 @@ void ManageOpenTrades() {
         double cur     = (pos_type == POSITION_TYPE_BUY) ?
                          SymbolInfoDouble(sym, SYMBOL_BID) :
                          SymbolInfoDouble(sym, SYMBOL_ASK);
-        double sl_dist = MathAbs(entry - sl);
-        if (sl_dist == 0) continue;
+        double sl_dist_cur = MathAbs(entry - sl);
+        if (sl_dist_cur == 0) continue;
+        double sl_dist = LoadSlDist(sym, sl_dist_cur);
         double r  = (pos_type == POSITION_TYPE_BUY) ? (cur - entry) / sl_dist : (entry - cur) / sl_dist;
         double ps = (StringFind(sym, "JPY") >= 0) ? 0.01 : 0.0001;
 
@@ -532,35 +616,97 @@ void ManageOpenTrades() {
             }
         }
 
-        // 0.5R step-trail after partial close
+        // Production-grade trend-exit management after partial close
         if (IsSymbolPartialClosed(sym) && r >= Partial_Close_At_R) {
-            // Re-read SL/TP in case they were just modified above
+            // Re-read SL/TP/volume in case a partial close just fired above (same tick)
             if (PositionSelectByTicket(ticket)) {
-                sl = PositionGetDouble(POSITION_SL);
-                tp = PositionGetDouble(POSITION_TP);
+                sl   = PositionGetDouble(POSITION_SL);
+                tp   = PositionGetDouble(POSITION_TP);
+                lots = PositionGetDouble(POSITION_VOLUME);
             }
-            double r_step = MathFloor(r * 2.0) / 2.0;
-            if (r_step < Partial_Close_At_R) r_step = Partial_Close_At_R;
+            double atr_cur = GetATR(sym, 0);
 
-            double target_sl = (pos_type == POSITION_TYPE_BUY) ?
-                               entry + (r_step - 1.0) * sl_dist :
-                               entry - (r_step - 1.0) * sl_dist;
+            // ── Trend strength indicators ────────────────────────────
+            double adx_cur    = GetADX(sym, 0);
+            double ema10_cur  = GetMA(ma10_handles, sym, 0);
+            double ema20_cur  = GetMA(ma20_handles, sym, 0);
+            double ema10_prev = GetMA(ma10_handles, sym, 1);
+            double ema20_prev = GetMA(ma20_handles, sym, 1);
+
+            // EMA10/20 cross-back detection
+            // BUY: ema10 was above ema20, now crossed below → momentum lost
+            bool ema_cross_back = false;
+            if (pos_type == POSITION_TYPE_BUY)
+                ema_cross_back = (ema10_prev >= ema20_prev) && (ema10_cur < ema20_cur);
+            else
+                ema_cross_back = (ema10_prev <= ema20_prev) && (ema10_cur > ema20_cur);
+
+            bool adx_weak  = adx_cur < 25.0;
+            bool adx_dying = adx_cur < 20.0;
+
+            // ── Production Grade Exit Logic ──────────────────────────
+            // Case 1: ADX<20 AND EMA cross-back → Runner Full Close
+            if (adx_dying && ema_cross_back && r >= 3.0) {
+                MqlTradeRequest creq = {}; MqlTradeResult cres = {};
+                creq.action       = TRADE_ACTION_DEAL;
+                creq.position     = ticket;
+                creq.symbol       = sym;
+                creq.volume       = lots;
+                creq.type         = (pos_type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+                creq.price        = cur;
+                creq.deviation    = Slippage;
+                creq.magic        = Magic_Number;
+                creq.type_filling = GetFilling(sym);
+                if (OrderSend(creq, cres)) {
+                    string msg = StringFormat("[Mgr] RUNNER CLOSE ticket=%lld %s"
+                        " r=%.2f ADX=%.1f EMA-crossback → trend ended",
+                        (long)ticket, sym, r, adx_cur);
+                    if (Debug) Print(msg); SendTelegram(msg);
+                }
+                continue;
+            }
+
+            // Case 2: ADX<25 OR EMA cross-back → Tighten to ATR×0.5
+            double atr_mult = SL_ATR_Mult;  // default (1.5 or 2.0)
+            if (adx_weak || ema_cross_back) {
+                atr_mult = 0.5;  // tighten — trend weakening
+                if (Debug) Print("[Mgr] Tighten ATR×0.5 ticket=", ticket,
+                                 " ADX=", DoubleToString(adx_cur, 1),
+                                 " cross_back=", ema_cross_back);
+            }
+
+            // ── SL = max(CurrentR-1, ATR trail) ─────────────────────
+            int    r_floor = (int)MathFloor(r);
+            if (r_floor < (int)Partial_Close_At_R) r_floor = (int)Partial_Close_At_R;
+            double step_sl = (pos_type == POSITION_TYPE_BUY)
+                              ? entry + (r_floor - 1) * sl_dist
+                              : entry - (r_floor - 1) * sl_dist;
+            double atr_sl  = (atr_cur > 0)
+                              ? ((pos_type == POSITION_TYPE_BUY) ? cur - atr_cur * atr_mult
+                                                                  : cur + atr_cur * atr_mult)
+                              : step_sl;
+            double target_sl = (pos_type == POSITION_TYPE_BUY)
+                                ? MathMax(step_sl, atr_sl)
+                                : MathMin(step_sl, atr_sl);
+
             bool should_move = (pos_type == POSITION_TYPE_BUY) ?
                                (target_sl > sl) : (target_sl < sl || sl == 0);
             if (should_move) {
                 if (ModifySLTP(ticket, sym, target_sl, tp) && Debug)
-                    Print("[Mgr] 0.5R step-trail ticket=", ticket,
+                    Print("[Mgr] Trail ticket=", ticket,
                           " r=", DoubleToString(r, 2),
-                          " step=", DoubleToString(r_step, 1),
+                          " step_sl=", DoubleToString(step_sl, 5),
+                          " atr_sl=", DoubleToString(atr_sl, 5),
+                          " mult=", DoubleToString(atr_mult, 1),
                           " → SL=", DoubleToString(target_sl, 5));
                 sl = target_sl;
             }
 
-            // TP extension
+            // ── TP extend ────────────────────────────────────────────
             double cur_tp  = tp;
-            double new_tp  = (pos_type == POSITION_TYPE_BUY) ?
-                             entry + (r_step + 0.5) * sl_dist :
-                             entry - (r_step + 0.5) * sl_dist;
+            double new_tp  = (pos_type == POSITION_TYPE_BUY)
+                              ? entry + (r_floor + 1) * sl_dist
+                              : entry - (r_floor + 1) * sl_dist;
             bool tp_behind = (pos_type == POSITION_TYPE_BUY) ?
                              (cur >= cur_tp - ps) : (cur <= cur_tp + ps);
             if (tp_behind && MathAbs(new_tp - cur_tp) > ps) {
@@ -655,7 +801,11 @@ void CloseAllPositions(string reason) {
                 Print("[Trade CLOSE] failed ticket=", ticket, " err=", GetLastError());
         } else {
             double sl_dist = MathAbs(entry - sl);
-            double atr = GetATR(sym);
+            // FIX B (v1.11): explicit shift=0 (current/live bar) — matches MT4's
+            // iATR(sym,60,14,0) in the same function. The GetATR() default of
+            // shift=1 (previous closed bar) was being used here before, which
+            // is a one-bar-stale value versus MT4's live-bar lock-in buffer.
+            double atr = GetATR(sym, 0);
             double buf = MathMax(sl_dist * 0.20, atr * 0.3);
             buf = MathMin(buf, atr * 2.0);
             double new_sl = (pos_type == POSITION_TYPE_BUY) ? cur - buf : cur + buf;
@@ -695,7 +845,7 @@ void DetectAndReportClosedTrades() {
         if (PositionSelectByTicket(pos_id)) continue;
 
         string sym = HistoryDealGetString(deal_ticket, DEAL_SYMBOL);
-        if (!HasOpenPosition(sym)) { ClearSymbolPartialClosed(sym); ClearOpenedSymbol(sym); }
+        if (!HasOpenPosition(sym)) { ClearSymbolPartialClosed(sym); ClearOpenedSymbol(sym); ClearSlDist(sym); }
 
         // Aggregate ALL out-deals for this position (handles partial closes)
         double total_profit = 0, total_commission = 0, total_swap = 0;

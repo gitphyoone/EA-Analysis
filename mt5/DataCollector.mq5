@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT5 Data Collector v1.00                     |
+//| V19 FX Prop Desk — MT5 Data Collector v1.01                     |
 //| Ported from MT4 DataCollector v1.00                             |
 //| Collects H1 OHLCV + EMA10/20/50/200, RSI14, ADX14, ATR14       |
 //| Sends to FastAPI via WebRequest                                  |
@@ -11,16 +11,32 @@
 //|  - AccountEquity/Balance → AccountInfoDouble                    |
 //|  - char[] → uchar[] for WebRequest                              |
 //|  - %I64d → %lld for long                                        |
+//| v1.01 — MT4/MT5 logic-parity fixes:                             |
+//|  - FIX C: ema50_prev/ema200_prev fields added. MT4's collector  |
+//|    sends these (shift=2 EMA reads) specifically so the backend  |
+//|    SignalEngine's ema_slope filter can score EMA50/200          |
+//|    rising/falling. Without them, SignalEngine.evaluate() treats |
+//|    ema50_prev/ema200_prev as missing and silently skips the     |
+//|    slope filter (no penalty) for every MT5-sourced symbol —     |
+//|    no new indicator handle needed, ema50/ema200 handles already |
+//|    created in OnInit are just read at shift=2 instead of 1.     |
+//|  - FIX D: CollectOnTick input added to match MT4's on/off       |
+//|    toggle. MT5's OnTick() previously called CollectAll()        |
+//|    unconditionally with no way to disable it.                   |
+//|  - NOTE (not fixed here, unconfirmed): Symbol_List uses plain   |
+//|    "USDJPY" while MT4 uses "USDJPY.y" (broker suffix). Verify   |
+//|    against this MT5 account's actual Market Watch symbol name.  |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.00"
+#property version   "1.01"
 
 // ── Inputs ──────────────────────────────────────────────────────────
 input string             FastAPI_URL        = "http://127.0.0.1/data/candle";
 input string             FastAPI_AccountURL = "http://127.0.0.1/data/account";
 input string             API_Key            = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string             Symbol_List        = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,EURJPY";
+input string              Symbol_List        = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,EURJPY";
 input ENUM_TIMEFRAMES    Timeframe          = PERIOD_H1;
+input bool               CollectOnTick      = true;   // FIX D (v1.01): matches MT4's toggle
 input bool               Debug              = true;
 
 // ── State ────────────────────────────────────────────────────────────
@@ -87,8 +103,9 @@ int OnInit() {
     }
     num_symbols = n;
     EventSetTimer(60);
-    Print("[DataCollector MT5 v1.00] Initialized | symbols=", Symbol_List,
-          " | timeframe=", EnumToString(Timeframe));
+    Print("[DataCollector MT5 v1.01] Initialized | symbols=", Symbol_List,
+          " | timeframe=", EnumToString(Timeframe),
+          " | CollectOnTick=", CollectOnTick);
     return INIT_SUCCEEDED;
 }
 
@@ -112,7 +129,11 @@ void OnTimer() {
     SendAccountSnapshot();
 }
 
-void OnTick() { CollectAll(); }
+// FIX D (v1.01): CollectOnTick toggle now respected, matching MT4's
+// "input int CollectOnTick" behavior (previously always collected).
+void OnTick() {
+    if (CollectOnTick) CollectAll();
+}
 
 // ── Main collection ───────────────────────────────────────────────────
 void CollectAll() {
@@ -138,11 +159,16 @@ void CollectAndSend(int idx, string sym) {
     if (CopyTickVolume(sym, Timeframe, 1, 1, vol_buf) != 1) vol_buf[0] = 0;
     if (CopyTime(sym, Timeframe, 1, 1, time_buf) != 1) { Print("[DC] CopyTime fail ", sym); return; }
 
-    // Indicators at bar 1
+    // Indicators at bar 1 (last closed bar)
     double ema10  = GetBuf(h_ema10[idx],  0, 1);
     double ema20  = GetBuf(h_ema20[idx],  0, 1);
     double ema50  = GetBuf(h_ema50[idx],  0, 1);
     double ema200 = GetBuf(h_ema200[idx], 0, 1);
+    // FIX C (v1.01): ema50_prev/ema200_prev at bar 2 — required by backend
+    // SignalEngine's ema_slope filter (rising/falling check). Reuses the
+    // existing h_ema50/h_ema200 handles at shift=2, no new handle needed.
+    double ema50_prev  = GetBuf(h_ema50[idx],  0, 2);
+    double ema200_prev = GetBuf(h_ema200[idx], 0, 2);
     double rsi    = GetBuf(h_rsi[idx],    0, 1);
     double adx    = GetBuf(h_adx[idx],    0, 1);  // buffer 0 = ADX main
     double di_p   = GetBuf(h_adx[idx],    1, 1);  // buffer 1 = +DI
@@ -163,6 +189,8 @@ void CollectAndSend(int idx, string sym) {
         "\"ema20\":%.6f,"
         "\"ema50\":%.6f,"
         "\"ema200\":%.6f,"
+        "\"ema50_prev\":%.6f,"
+        "\"ema200_prev\":%.6f,"
         "\"rsi14\":%.4f,"
         "\"adx14\":%.4f,"
         "\"di_plus\":%.4f,"
@@ -174,6 +202,7 @@ void CollectAndSend(int idx, string sym) {
         open_buf[0], high_buf[0], low_buf[0], close_buf[0],
         vol_buf[0],
         ema10, ema20, ema50, ema200,
+        ema50_prev, ema200_prev,
         rsi, adx, di_p, di_m, atr
     );
 
@@ -188,7 +217,11 @@ void CollectAndSend(int idx, string sym) {
 
     if (Debug) {
         if (res == 201 || res == 200)
-            Print("[DataCollector] OK ", sym, " | ", FormatTimestamp(time_buf[0]));
+            Print("[DataCollector] OK ", sym, " | ", FormatTimestamp(time_buf[0]),
+                  " ema10=", DoubleToString(ema10,5),
+                  " ema20=", DoubleToString(ema20,5),
+                  " ema50_slope=", DoubleToString(ema50-ema50_prev,6),
+                  " ema200_slope=", DoubleToString(ema200-ema200_prev,6));
         else
             Print("[DataCollector] FAIL ", sym, " HTTP=", res,
                   " body=", CharArrayToString(result));
