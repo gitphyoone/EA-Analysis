@@ -107,16 +107,18 @@ async def drawdown_summary(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
-    UTC = timezone.utc
-    today = datetime.now(UTC).date()
+    # Use JST (not UTC) to match /analytics/trade-history and /analytics/signal-log,
+    # which both bucket "today/this week/this month" by JST. Using UTC here caused
+    # Overview cards to disagree with the History tab for trades closed 00:00-09:00 JST.
+    today = datetime.now(JST).date()
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
 
     def utc_day_start(d: date) -> datetime:
-        return datetime(d.year, d.month, d.day, tzinfo=UTC)
+        return datetime(d.year, d.month, d.day, tzinfo=JST)
 
     def utc_day_end(d: date) -> datetime:
-        return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=UTC)
+        return datetime(d.year, d.month, d.day, 23, 59, 59, tzinfo=JST)
 
     async def dd_for_period(start: date, end: date = None) -> float:
         # FIX: daily_loss was returning 0 because no end-date bound was set.

@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -10,6 +12,8 @@ from ..schemas.trade import TradeIn, TradeOut, TradeCloseIn, TradeCloseByTicketI
 from ..engines.trade_manager import TradeManager
 from ..services.journal_service import JournalService
 from ..auth import verify_api_key
+
+logger = logging.getLogger("ea.trades")
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 
@@ -33,21 +37,36 @@ async def open_trade(
 
 async def _apply_close(trade: Trade, payload, db: AsyncSession):
     # Use MT4's reported profit (account currency) when available; fallback to local calc
-    # for USD-quoted pairs only. Local calc gives quote-currency units which are wrong for
-    # JPY/CAD/CHF pairs (e.g. USDJPY result would be in JPY, inflated ~160×).
+    # for USD-quoted pairs only (see _is_usd_quoted below) — local calc gives quote-currency
+    # units which are wrong for JPY/CAD/CHF pairs (e.g. USDJPY result would be in JPY,
+    # inflated ~160x).
     # MT4/MT5 report commission and swap as signed values (negative = cost,
     # positive = credit) — matches the broker statement's own net formula
     # "Commission + Swap + Profit + Taxes". Do not abs() the swap: a positive
     # swap (long-term carry credit) must be added, not subtracted.
     if payload.profit is not None:
         gross_pnl = Decimal(str(payload.profit))
-    else:
+    elif _is_usd_quoted(trade.symbol):
         gross_pnl = _calc_pnl(trade, payload.exit_price)
-    net_pnl = gross_pnl + (payload.commission or Decimal(0)) + (payload.swap or Decimal(0))
+    else:
+        # No broker-reported profit and the pair isn't USD-quoted (e.g. USDJPY,
+        # GBPJPY, USDCAD) — _calc_pnl() would return quote-currency units
+        # (JPY/CAD/...) mislabeled as USD, inflating PnL by the exchange rate
+        # (~160x for JPY pairs). Leave unset rather than store a wrong-currency
+        # number; SUM() in analytics ignores NULLs so totals stay correct.
+        gross_pnl = None
+        logger.warning(
+            "No broker profit for non-USD-quoted close: ticket=%s symbol=%s — gross_pnl left NULL",
+            trade.ticket, trade.symbol,
+        )
+    net_pnl = (
+        gross_pnl + (payload.commission or Decimal(0)) + (payload.swap or Decimal(0))
+        if gross_pnl is not None else None
+    )
     sl_distance = abs(trade.entry_price - trade.stop_loss) if trade.stop_loss else None
     r_multiple = (
         (gross_pnl / (sl_distance * trade.lot_size * Decimal("100000"))).quantize(Decimal("0.01"))
-        if sl_distance and sl_distance > 0 and trade.lot_size
+        if gross_pnl is not None and sl_distance and sl_distance > 0 and trade.lot_size
         else None
     )
     opened_at = trade.opened_at or datetime.now(timezone.utc)
@@ -91,7 +110,11 @@ async def _apply_close(trade: Trade, payload, db: AsyncSession):
     if payload.account_equity:
         await JournalService().update_daily(db, closed_at.date(), payload.account_equity)
 
-    return {"message": "Trade closed", "net_pnl": float(net_pnl), "r_multiple": float(r_multiple or 0)}
+    return {
+        "message": "Trade closed",
+        "net_pnl": float(net_pnl) if net_pnl is not None else None,
+        "r_multiple": float(r_multiple or 0),
+    }
 
 
 @router.post("/close/{trade_id}", status_code=200)
@@ -169,6 +192,14 @@ async def list_open_trades(
 ):
     result = await db.execute(select(Trade).where(Trade.status == "OPEN"))
     return result.scalars().all()
+
+
+def _is_usd_quoted(symbol: str) -> bool:
+    # Standard 6-letter FX symbol is BASE(3)+QUOTE(3), optionally followed by a
+    # broker suffix (e.g. "USDJPY.y", "EURUSDm"). _calc_pnl() below computes
+    # price_diff * lot_size * 100000, which is denominated in the QUOTE
+    # currency — only safe to treat as account currency (USD) when quote == USD.
+    return len(symbol) >= 6 and symbol[3:6].upper() == "USD"
 
 
 def _calc_pnl(trade: Trade, exit_price: Decimal) -> Decimal:

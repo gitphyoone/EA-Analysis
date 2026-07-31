@@ -621,6 +621,7 @@ void DetectAndReportClosedTrades() {
         double   o_sl       = OrderStopLoss();
         double   commission = OrderCommission();
         double   swap_val   = OrderSwap();
+        double   profit_val = OrderProfit();
         datetime close_time = OrderCloseTime();
         // After this point: use captured vars only. No more Order*() calls.
 
@@ -644,9 +645,9 @@ void DetectAndReportClosedTrades() {
         else if (hit_sl) reason="SL";
 
         string body=StringFormat(
-            "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,"
+            "{\"exit_price\":%.6f,\"commission\":%.2f,\"swap\":%.2f,\"profit\":%.2f,"
             "\"exit_reason\":\"%s\",\"closed_at\":\"%s\",\"account_equity\":%.2f}",
-            cp,commission,swap_val,reason,FormatISO8601(close_time),AccountEquity());
+            cp,commission,swap_val,profit_val,reason,FormatISO8601(close_time),AccountEquity());
         string url=FastAPI_Base+"/trades/close/by-ticket/"+IntegerToString(ticket);
         char post[],result[]; string rh;
         StringToCharArray(body,post,0,StringLen(body));
