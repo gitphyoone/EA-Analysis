@@ -3,6 +3,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -24,6 +25,17 @@ async def open_trade(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
+    # FIX: guard against duplicate "open" notifications for the same ticket
+    # (e.g. NotifyBackend() retried after a transient WebRequest failure, or
+    # an EA restart re-sending an open it already reported). Without this, two
+    # Trade rows with the same ticket+status=OPEN could exist, which lets
+    # close/by-ticket "succeed" twice — once against each row — producing
+    # duplicate TradeHistory entries and inflating aggregate loss figures
+    # (this is what happened to tickets ...280/271/291 on 2026-08-06).
+    existing = await db.execute(select(Trade).where(Trade.ticket == payload.ticket))
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(409, f"Trade already exists for ticket {payload.ticket}")
+
     trade = Trade(
         **payload.model_dump(),
         status="OPEN",
@@ -139,13 +151,34 @@ async def close_trade_by_ticket(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(verify_api_key),
 ):
+    # FIX: row-level lock (SELECT ... FOR UPDATE) — closes the race window
+    # between reading status=="OPEN" and committing status="CLOSED". Without
+    # this, two near-simultaneous close requests for the same ticket (e.g.
+    # from an EA restart re-sending a close it already reported) could both
+    # read "OPEN" before either commits, producing two TradeHistory rows for
+    # the same ticket — this is what happened to tickets ...280/271/291 on
+    # 2026-08-06. The second request now blocks until the first transaction
+    # commits, then re-reads status="CLOSED" and correctly 404s.
     result = await db.execute(
-        select(Trade).where(Trade.ticket == ticket, Trade.status == "OPEN")
+        select(Trade)
+        .where(Trade.ticket == ticket, Trade.status == "OPEN")
+        .with_for_update()
     )
     trade = result.scalar_one_or_none()
     if trade is None:
         raise HTTPException(404, f"No open trade for ticket {ticket}")
-    return await _apply_close(trade, payload, db)
+
+    try:
+        return await _apply_close(trade, payload, db)
+    except IntegrityError:
+        # FIX: belt-and-suspenders for when a DB unique constraint on
+        # TradeHistory.ticket is added later (not added yet — existing
+        # duplicate rows need cleanup first). Once that constraint exists,
+        # this catches any remaining race and treats it as an already-
+        # applied close rather than erroring.
+        await db.rollback()
+        logger.warning("Duplicate close ignored for ticket=%s", ticket)
+        return {"message": "Trade already closed (duplicate close ignored)"}
 
 
 @router.post("/manage/{trade_id}")

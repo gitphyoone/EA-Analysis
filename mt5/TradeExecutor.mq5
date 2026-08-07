@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT5 Trade Executor v1.11                     |
+//| V19 FX Prop Desk — MT5 Trade Executor v1.12                     |
 //| Ported from MT4 TradeExecutor v2.10                             |
 //|                                                                  |
 //| MQL4→MQL5 key changes:                                          |
@@ -35,23 +35,51 @@
 //|    "USDJPY" while MT4 uses "USDJPY.y" (broker suffix). Verify   |
 //|    against this MT5 account's actual Market Watch symbol name   |
 //|    before relying on USDJPY signals/trades.                     |
+//| CONFIRMED (chat): switching SL_ATR_Mult 2.0→1.5 and             |
+//|    Partial_Close_At_R 4.0→2.0 fixed step-trail on H1 — but the  |
+//|    underlying data source was still hardcoded to H1 regardless  |
+//|    of these input labels. v1.12 fixes that.                     |
+//| v1.12 — H1/H4 dual-instance support:                             |
+//|  - FIX E: Signal_Timeframe input added. Previously PERIOD_H1    |
+//|    was hardcoded in OnInit()'s indicator handle creation, in    |
+//|    FetchSignal()'s URL query string, and in LogRejectReason()'s |
+//|    JSON body — meaning the SL_ATR_Mult/Partial_Close_At_R       |
+//|    "H1=.../H4=..." input comments were cosmetic only; the       |
+//|    actual candle/indicator data was always H1 no matter what.   |
+//|    Now Signal_Timeframe drives all three, so this same file can |
+//|    run as a second, independent H4 instance (with its own      |
+//|    Magic_Number) alongside the existing H1 instance.            |
+//|  - To run H4 alongside H1: attach this EA to a second chart     |
+//|    with Signal_Timeframe=PERIOD_H4, Magic_Number=<different     |
+//|    value, e.g. 19002>, SL_ATR_Mult=2.0, Partial_Close_At_R=4.0. |
+//|    Different Magic_Number is required — GV keys (GV_PC, GV_SLD) |
+//|    and position/history filtering are all keyed by symbol+magic,|
+//|    so the two instances won't interfere with each other even    |
+//|    when trading the same symbols.                                |
+//|  - NOT verified here: whether the backend's /signals/evaluate    |
+//|    endpoint and market_data table actually distinguish H1 vs    |
+//|    H4 rows. DataCollector must also be run as a second H4       |
+//|    instance (see DataCollector.mq5 v1.02) for this to work end-  |
+//|    to-end — check backend routers/signals.py if H4 signals      |
+//|    come back empty or identical to H1.                          |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.11"
+#property version   "1.12"
 
 // ── Inputs ──────────────────────────────────────────────────────────
-input string FastAPI_Base           = "http://127.0.0.1";
-input string API_Key                = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string Symbol_List            = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY";
-input int    Poll_Seconds           = 10;
-input long   Magic_Number           = 19001;
-input int    Slippage               = 3;
-input bool   Enable_Trading         = true;
-input double BE_Buffer_Pips         = 1.0;
-input int    Friday_Close_Hour      = 20;
-input string Telegram_Token         = "";
-input string Telegram_Chat_ID       = "";
-input bool   Debug                  = true;
+input string           FastAPI_Base         = "http://127.0.0.1";
+input string           API_Key              = "f9e369ad5592a0dcd33c78c4e33bd382";
+input string            Symbol_List          = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY";
+input ENUM_TIMEFRAMES   Signal_Timeframe     = PERIOD_H1;  // FIX E (v1.12): drives indicators + signal URL + reject-log
+input int               Poll_Seconds         = 10;
+input long              Magic_Number         = 19001;      // MUST differ between the H1 and H4 instances
+input int                Slippage             = 3;
+input bool                Enable_Trading       = true;
+input double               BE_Buffer_Pips       = 1.0;
+input int                    Friday_Close_Hour    = 20;
+input string                  Telegram_Token       = "";
+input string                   Telegram_Chat_ID     = "";
+input bool                      Debug                = true;
 
 input int    Max_Open_Positions     = 5;
 input double Portfolio_Max_Risk_Pct = 6.0;
@@ -87,6 +115,23 @@ int    ma10_handles[];  // EMA(10) close, one per symbol
 int    ma20_handles[];  // EMA(20) close, one per symbol
 
 // ── Utility helpers ──────────────────────────────────────────────────
+// FIX E (v1.12): maps ENUM_TIMEFRAMES to the string the backend expects
+// (used so "H1" is no longer hardcoded in the signal URL / reject-log body).
+string TFToString(ENUM_TIMEFRAMES tf) {
+    switch (tf) {
+        case PERIOD_M1:  return "M1";
+        case PERIOD_M5:  return "M5";
+        case PERIOD_M15: return "M15";
+        case PERIOD_M30: return "M30";
+        case PERIOD_H1:  return "H1";
+        case PERIOD_H4:  return "H4";
+        case PERIOD_D1:  return "D1";
+        case PERIOD_W1:  return "W1";
+        case PERIOD_MN1: return "MN1";
+        default:         return "H1";
+    }
+}
+
 bool IsOpenedSymbol(string sym) {
     for (int i = 0; i < g_opened_count; i++)
         if (g_opened_symbols[i] == sym) return true;
@@ -108,6 +153,8 @@ void ClearOpenedSymbol(string sym) {
 }
 
 // Partial-close flag per symbol (stored in Global Variables)
+// Keyed by symbol+magic, so H1 and H4 instances (different Magic_Number)
+// never collide even when trading the same symbol.
 string GV_PC(string sym) { return "PC_" + sym + "_" + IntegerToString(Magic_Number); }
 bool IsSymbolPartialClosed(string sym) { return GlobalVariableCheck(GV_PC(sym)); }
 void MarkSymbolPartialClosed(string sym) { GlobalVariableSet(GV_PC(sym), (double)TimeCurrent()); }
@@ -315,23 +362,26 @@ int OnInit() {
     for (int j = 0; j < ArraySize(g_opened_symbols); j++) g_opened_symbols[j] = "";
 
     // Create indicator handles for each symbol
+    // FIX E (v1.12): uses Signal_Timeframe instead of hardcoded PERIOD_H1,
+    // so this same file can be attached a second time as an H4 instance.
     ArrayResize(atr_handles, num_symbols);
     ArrayResize(adx_handles, num_symbols);
     ArrayResize(ma10_handles, num_symbols);
     ArrayResize(ma20_handles, num_symbols);
     for (int i = 0; i < num_symbols; i++) {
-        atr_handles[i]  = iATR(symbols[i], PERIOD_H1, 14);
-        adx_handles[i]  = iADX(symbols[i], PERIOD_H1, 14);
-        ma10_handles[i] = iMA(symbols[i], PERIOD_H1, 10, 0, MODE_EMA, PRICE_CLOSE);
-        ma20_handles[i] = iMA(symbols[i], PERIOD_H1, 20, 0, MODE_EMA, PRICE_CLOSE);
+        atr_handles[i]  = iATR(symbols[i], Signal_Timeframe, 14);
+        adx_handles[i]  = iADX(symbols[i], Signal_Timeframe, 14);
+        ma10_handles[i] = iMA(symbols[i], Signal_Timeframe, 10, 0, MODE_EMA, PRICE_CLOSE);
+        ma20_handles[i] = iMA(symbols[i], Signal_Timeframe, 20, 0, MODE_EMA, PRICE_CLOSE);
         if (atr_handles[i] == INVALID_HANDLE || adx_handles[i] == INVALID_HANDLE ||
             ma10_handles[i] == INVALID_HANDLE || ma20_handles[i] == INVALID_HANDLE)
             Print("[Executor] WARNING: indicator handle failed for ", symbols[i]);
     }
 
     EventSetTimer(Poll_Seconds);
-    Print("[Executor MT5 v1.11] Initialized"
-          " | symbols=", Symbol_List, " | magic=", Magic_Number,
+    Print("[Executor MT5 v1.12] Initialized"
+          " | symbols=", Symbol_List, " | timeframe=", TFToString(Signal_Timeframe),
+          " | magic=", Magic_Number,
           " | max_pos=", Max_Open_Positions, " | portfolio=", Portfolio_Max_Risk_Pct, "%"
           " | risk=", Risk_Per_Trade_Pct, "% | TP=", TP_R_Multiple, "R"
           " | SL_mult=", SL_ATR_Mult,
@@ -446,7 +496,10 @@ string FetchSignal(string sym, int &sc, double &rsi, double &adx,
     double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
     double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
     double pv = (ts > 0) ? tv / ts * ps : 0.0;
-    string url = GETUrl(StringFormat("/signals/evaluate/%s?timeframe=H1&pip_value=%.6f", sym, pv));
+    // FIX E (v1.12): timeframe query param now driven by Signal_Timeframe
+    // instead of a hardcoded "H1" literal.
+    string url = GETUrl(StringFormat("/signals/evaluate/%s?timeframe=%s&pip_value=%.6f",
+                                     sym, TFToString(Signal_Timeframe), pv));
     uchar dummy[], result[]; string rh;
     int res = WebRequest("GET", url, "", 5000, dummy, result, rh);
     if (res != 200) { if (Debug) Print("[Executor] Signal HTTP=", res, " ", sym); return ""; }
@@ -462,10 +515,12 @@ string FetchSignal(string sym, int &sc, double &rsi, double &adx,
     return dir;
 }
 void LogRejectReason(string sym, int score, string reason) {
+    // FIX E (v1.12): timeframe field now driven by Signal_Timeframe
+    // instead of a hardcoded "H1" literal.
     string body = StringFormat(
-        "{\"symbol\":\"%s\",\"timeframe\":\"H1\",\"direction\":\"NO_TRADE\","
+        "{\"symbol\":\"%s\",\"timeframe\":\"%s\",\"direction\":\"NO_TRADE\","
         "\"score\":%d,\"reject_reason\":\"%s\",\"timestamp\":\"%s\"}",
-        sym, score, reason, FormatTimestamp(TimeCurrent()));
+        sym, TFToString(Signal_Timeframe), score, reason, FormatTimestamp(TimeCurrent()));
     string url = FastAPI_Base + "/signals/log";
     uchar post_data[], result[]; string rh;
     StringToCharArray(body, post_data, 0, StringLen(body));
@@ -802,9 +857,7 @@ void CloseAllPositions(string reason) {
         } else {
             double sl_dist = MathAbs(entry - sl);
             // FIX B (v1.11): explicit shift=0 (current/live bar) — matches MT4's
-            // iATR(sym,60,14,0) in the same function. The GetATR() default of
-            // shift=1 (previous closed bar) was being used here before, which
-            // is a one-bar-stale value versus MT4's live-bar lock-in buffer.
+            // iATR(sym,60,14,0) in the same function.
             double atr = GetATR(sym, 0);
             double buf = MathMax(sl_dist * 0.20, atr * 0.3);
             buf = MathMin(buf, atr * 2.0);

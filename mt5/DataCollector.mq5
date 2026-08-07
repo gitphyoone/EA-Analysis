@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT5 Data Collector v1.01                     |
+//| V19 FX Prop Desk — MT5 Data Collector v1.02                     |
 //| Ported from MT4 DataCollector v1.00                             |
 //| Collects H1 OHLCV + EMA10/20/50/200, RSI14, ADX14, ATR14       |
 //| Sends to FastAPI via WebRequest                                  |
@@ -26,18 +26,32 @@
 //|  - NOTE (not fixed here, unconfirmed): Symbol_List uses plain   |
 //|    "USDJPY" while MT4 uses "USDJPY.y" (broker suffix). Verify   |
 //|    against this MT5 account's actual Market Watch symbol name.  |
+//| v1.02 — H1/H4 dual-instance support:                             |
+//|  - FIX F: the JSON "timeframe" field was hardcoded to the        |
+//|    literal string "H1" even though the Timeframe input (already |
+//|    present since v1.00) could be set to PERIOD_H4. That meant   |
+//|    every row this collector sent — including any already run on |
+//|    H4 — was mislabeled as H1 in market_data, which would make   |
+//|    backend H1/H4 signal queries indistinguishable. Now the      |
+//|    field is derived from the actual Timeframe input via         |
+//|    TFToString(), matching the same fix applied to               |
+//|    TradeExecutor.mq5 v1.12.                                     |
+//|  - To run H4 alongside H1: attach this EA to a second chart     |
+//|    with Timeframe=PERIOD_H4. No Magic_Number conflict risk here |
+//|    — this EA doesn't trade, it only POSTs candle/indicator data,|
+//|    now correctly tagged per-timeframe.                          |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.01"
+#property version   "1.02"
 
 // ── Inputs ──────────────────────────────────────────────────────────
 input string             FastAPI_URL        = "http://127.0.0.1/data/candle";
 input string             FastAPI_AccountURL = "http://127.0.0.1/data/account";
 input string             API_Key            = "f9e369ad5592a0dcd33c78c4e33bd382";
 input string              Symbol_List        = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,EURJPY";
-input ENUM_TIMEFRAMES    Timeframe          = PERIOD_H1;
-input bool               CollectOnTick      = true;   // FIX D (v1.01): matches MT4's toggle
-input bool               Debug              = true;
+input ENUM_TIMEFRAMES    Timeframe          = PERIOD_H1;   // set to PERIOD_H4 for the H4 instance
+input bool               CollectOnTick      = true;
+input bool                Debug              = true;
 
 // ── State ────────────────────────────────────────────────────────────
 string   symbols[];
@@ -66,6 +80,23 @@ double GetBuf(int handle, int buf_idx, int shift) {
     double buf[1];
     if (CopyBuffer(handle, buf_idx, shift, 1, buf) != 1) return 0.0;
     return buf[0];
+}
+// FIX F (v1.02): maps ENUM_TIMEFRAMES to the string the backend expects —
+// mirrors TFToString() in TradeExecutor.mq5 v1.12 so both files tag data
+// the same way.
+string TFToString(ENUM_TIMEFRAMES tf) {
+    switch (tf) {
+        case PERIOD_M1:  return "M1";
+        case PERIOD_M5:  return "M5";
+        case PERIOD_M15: return "M15";
+        case PERIOD_M30: return "M30";
+        case PERIOD_H1:  return "H1";
+        case PERIOD_H4:  return "H4";
+        case PERIOD_D1:  return "D1";
+        case PERIOD_W1:  return "W1";
+        case PERIOD_MN1: return "MN1";
+        default:         return "H1";
+    }
 }
 
 // ── OnInit ────────────────────────────────────────────────────────────
@@ -103,8 +134,8 @@ int OnInit() {
     }
     num_symbols = n;
     EventSetTimer(60);
-    Print("[DataCollector MT5 v1.01] Initialized | symbols=", Symbol_List,
-          " | timeframe=", EnumToString(Timeframe),
+    Print("[DataCollector MT5 v1.02] Initialized | symbols=", Symbol_List,
+          " | timeframe=", TFToString(Timeframe),
           " | CollectOnTick=", CollectOnTick);
     return INIT_SUCCEEDED;
 }
@@ -129,8 +160,6 @@ void OnTimer() {
     SendAccountSnapshot();
 }
 
-// FIX D (v1.01): CollectOnTick toggle now respected, matching MT4's
-// "input int CollectOnTick" behavior (previously always collected).
 void OnTick() {
     if (CollectOnTick) CollectAll();
 }
@@ -164,9 +193,8 @@ void CollectAndSend(int idx, string sym) {
     double ema20  = GetBuf(h_ema20[idx],  0, 1);
     double ema50  = GetBuf(h_ema50[idx],  0, 1);
     double ema200 = GetBuf(h_ema200[idx], 0, 1);
-    // FIX C (v1.01): ema50_prev/ema200_prev at bar 2 — required by backend
-    // SignalEngine's ema_slope filter (rising/falling check). Reuses the
-    // existing h_ema50/h_ema200 handles at shift=2, no new handle needed.
+    // ema50_prev/ema200_prev at bar 2 — required by backend SignalEngine's
+    // ema_slope filter (rising/falling check).
     double ema50_prev  = GetBuf(h_ema50[idx],  0, 2);
     double ema200_prev = GetBuf(h_ema200[idx], 0, 2);
     double rsi    = GetBuf(h_rsi[idx],    0, 1);
@@ -175,10 +203,12 @@ void CollectAndSend(int idx, string sym) {
     double di_m   = GetBuf(h_adx[idx],    2, 1);  // buffer 2 = -DI
     double atr    = GetBuf(h_atr[idx],    0, 1);
 
+    // FIX F (v1.02): "timeframe" is now TFToString(Timeframe) instead of
+    // the hardcoded literal "H1" — matters once a second H4 instance runs.
     string body = StringFormat(
         "{"
         "\"symbol\":\"%s\","
-        "\"timeframe\":\"H1\","
+        "\"timeframe\":\"%s\","
         "\"timestamp\":\"%s\","
         "\"open\":%.6f,"
         "\"high\":%.6f,"
@@ -198,6 +228,7 @@ void CollectAndSend(int idx, string sym) {
         "\"atr14\":%.6f"
         "}",
         sym,
+        TFToString(Timeframe),
         FormatTimestamp(time_buf[0]),
         open_buf[0], high_buf[0], low_buf[0], close_buf[0],
         vol_buf[0],
@@ -217,7 +248,7 @@ void CollectAndSend(int idx, string sym) {
 
     if (Debug) {
         if (res == 201 || res == 200)
-            Print("[DataCollector] OK ", sym, " | ", FormatTimestamp(time_buf[0]),
+            Print("[DataCollector] OK ", sym, " | ", TFToString(Timeframe), " | ", FormatTimestamp(time_buf[0]),
                   " ema10=", DoubleToString(ema10,5),
                   " ema20=", DoubleToString(ema20,5),
                   " ema50_slope=", DoubleToString(ema50-ema50_prev,6),
