@@ -82,6 +82,15 @@ async def evaluate_signal(
         htf_trend_up=htf_trend_up,           # FIX: multi-timeframe bias
         ema10=candle.ema10,                  # FIX: EMA10/20 short-term alignment score
         ema20=candle.ema20,
+        # FIX (chat): ema50_prev/ema200_prev were being computed and stored
+        # by both MT4 and MT5 DataCollector (specifically for this purpose)
+        # but were never forwarded to SignalEngine.evaluate() here — the
+        # engine's ema_slope_ok / ema_slope_score logic silently treated them
+        # as "not provided" (no penalty) for every symbol/timeframe, meaning
+        # the EMA50/200 rising-falling slope filter has never actually been
+        # active in production. Forwarding them now activates it.
+        ema50_prev=candle.ema50_prev,
+        ema200_prev=candle.ema200_prev,
     )
 
     # Session gate (includes Friday close check)
