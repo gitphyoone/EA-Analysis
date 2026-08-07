@@ -10,7 +10,7 @@ class Trade(Base):
     __tablename__ = "trades"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    ticket: Mapped[Optional[int]] = mapped_column(Integer)
+    ticket: Mapped[Optional[int]] = mapped_column(BigInteger)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     direction: Mapped[str] = mapped_column(String(4), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="OPEN")
@@ -46,7 +46,7 @@ class TradeHistory(Base):
     __tablename__ = "trade_history"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    ticket: Mapped[Optional[int]] = mapped_column(Integer)
+    ticket: Mapped[Optional[int]] = mapped_column(BigInteger)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     direction: Mapped[str] = mapped_column(String(4), nullable=False)
     entry_price: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
