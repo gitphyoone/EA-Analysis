@@ -39,6 +39,22 @@
 //|    Partial_Close_At_R 4.0→2.0 fixed step-trail on H1 — but the  |
 //|    underlying data source was still hardcoded to H1 regardless  |
 //|    of these input labels. v1.12 fixes that.                     |
+//| v1.13 — V19.1 Exit Improvement Memo (RED list, exit side):        |
+//|  - Max_Open_Positions default 5 → 3           (memo §13)          |
+//|  - Break-even trigger is now an input (BE_Trigger_R, default 1.0) |
+//|    and the BE buffer optionally adds the live spread so BE really |
+//|    covers trading cost, not just 1 pip        (memo §5 / §18)     |
+//|  - Single 30%-@-4R partial REPLACED by a 3-stage scale-out:       |
+//|      Stage 1  +TP1_R (1.0R) → close TP1_Close_Pct (30%), SL→BE   |
+//|      Stage 2  +TP2_R (2.0R) → close TP2_Close_Pct (30%), SL→+1R  |
+//|      Runner   remaining ~40% → ATR trail (Runner_Trail_ATR_Mult) |
+//|    All R levels / percentages are inputs      (memo §3 / §4 / §6) |
+//|  - Exit stage tracked as an int GV (PCSTAGE_) instead of the old  |
+//|    boolean PC_ flag; original entry lot saved in LOT_ GV so the   |
+//|    stage-2 close is a % of the ORIGINAL size, not the remainder.  |
+//|  - Re-entry cooldown / same-dir wait-candle / daily -2% stop are  |
+//|    enforced BACKEND-side (routers/signals.py) and arrive here as  |
+//|    a normal NO_TRADE + reject_reason — nothing to do in the EA.   |
 //| v1.12 — H1/H4 dual-instance support:                             |
 //|  - FIX E: Signal_Timeframe input added. Previously PERIOD_H1    |
 //|    was hardcoded in OnInit()'s indicator handle creation, in    |
@@ -64,7 +80,7 @@
 //|    come back empty or identical to H1.                          |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.12"
+#property version   "1.13"
 
 // ── Inputs ──────────────────────────────────────────────────────────
 input string           FastAPI_Base         = "http://127.0.0.1";
@@ -81,16 +97,25 @@ input string                  Telegram_Token       = "";
 input string                   Telegram_Chat_ID     = "";
 input bool                      Debug                = true;
 
-input int    Max_Open_Positions     = 5;
+input int    Max_Open_Positions     = 3;     // V19.1 §13 — was 5
 input double Portfolio_Max_Risk_Pct = 6.0;
 input double Risk_Per_Trade_Pct     = 1.0;
 input bool   Enable_Session_Filter  = false;
 input bool   Log_Reject_Reasons     = true;
 
-input double TP_R_Multiple          = 8.0;   // TP = SL_dist x R
+input double TP_R_Multiple          = 8.0;   // wide safety TP for the runner (SL_dist x R)
 input double SL_ATR_Mult            = 2.0;   // SL = ATR x mult (H1=1.5, H4=2.0)
-input double Partial_Close_At_R     = 4.0;   // partial trigger (H1=2.0, H4=4.0)
-input double Partial_Close_Ratio    = 0.30;  // 30% close at partial trigger
+
+// ── V19.1 staged exit (memo §3 / §4 / §5 / §6 / §18) ───────────────
+input double BE_Trigger_R           = 1.0;   // move SL to break-even at +this R — memo §5:
+                                             // NEVER before +0.8R (Option A) / +1.0R (Option B)
+input bool   BE_Cost_Buffer         = true;  // add live spread to the BE buffer (cover cost)
+input double TP1_R                  = 1.0;   // stage 1: trigger R
+input double TP1_Close_Pct          = 30.0;  // stage 1: % of ORIGINAL lot to close
+input double TP2_R                  = 2.0;   // stage 2: trigger R
+input double TP2_Close_Pct          = 30.0;  // stage 2: % of ORIGINAL lot to close
+input double Runner_Trail_Start_R   = 1.0;   // runner: ATR trail active from +this R
+input double Runner_Trail_ATR_Mult  = 1.5;   // runner: trail distance = ATR x this (test 1.5 / 2.0)
 
 input double CB_Level1_DD_Pct       = 3.0;
 input double CB_Level2_DD_Pct       = 5.0;
@@ -152,14 +177,33 @@ void ClearOpenedSymbol(string sym) {
     }
 }
 
-// Partial-close flag per symbol (stored in Global Variables)
-// Keyed by symbol+magic, so H1 and H4 instances (different Magic_Number)
-// never collide even when trading the same symbol.
-string GV_PC(string sym) { return "PC_" + sym + "_" + IntegerToString(Magic_Number); }
-bool IsSymbolPartialClosed(string sym) { return GlobalVariableCheck(GV_PC(sym)); }
-void MarkSymbolPartialClosed(string sym) { GlobalVariableSet(GV_PC(sym), (double)TimeCurrent()); }
-void ClearSymbolPartialClosed(string sym) {
-    if (GlobalVariableCheck(GV_PC(sym))) GlobalVariableDel(GV_PC(sym));
+// V19.1: exit stage per symbol (0 = full position / no scale-out yet,
+// 1 = stage-1 partial done, 2 = stage-2 partial done → runner).
+// Keyed by symbol+magic so H1 and H4 instances never collide.
+string GV_STAGE(string sym) { return "PCSTAGE_" + sym + "_" + IntegerToString(Magic_Number); }
+int  GetExitStage(string sym) {
+    string gv = GV_STAGE(sym);
+    return GlobalVariableCheck(gv) ? (int)GlobalVariableGet(gv) : 0;
+}
+void SetExitStage(string sym, int stage) { GlobalVariableSet(GV_STAGE(sym), (double)stage); }
+void ClearExitStage(string sym) {
+    if (GlobalVariableCheck(GV_STAGE(sym))) GlobalVariableDel(GV_STAGE(sym));
+    // also clear any legacy v1.12 boolean flag left over from before the upgrade
+    string legacy = "PC_" + sym + "_" + IntegerToString(Magic_Number);
+    if (GlobalVariableCheck(legacy)) GlobalVariableDel(legacy);
+}
+
+// V19.1: original entry lot size — stage-1/stage-2 closes are a % of THIS,
+// not of the shrinking remainder, so the runner ends up at the intended ~40%.
+string GV_LOT(string sym) { return "LOT_" + sym + "_" + IntegerToString(Magic_Number); }
+void   SaveOrigLot(string sym, double lots) { GlobalVariableSet(GV_LOT(sym), lots); }
+double LoadOrigLot(string sym, double fallback) {
+    string gv = GV_LOT(sym);
+    if (GlobalVariableCheck(gv)) { double v = GlobalVariableGet(gv); if (v > 0) return v; }
+    return fallback;
+}
+void ClearOrigLot(string sym) {
+    if (GlobalVariableCheck(GV_LOT(sym))) GlobalVariableDel(GV_LOT(sym));
 }
 
 // Original ATR-based SL distance at entry (see header note — required so
@@ -379,13 +423,15 @@ int OnInit() {
     }
 
     EventSetTimer(Poll_Seconds);
-    Print("[Executor MT5 v1.12] Initialized"
+    Print("[Executor MT5 v1.13] Initialized"
           " | symbols=", Symbol_List, " | timeframe=", TFToString(Signal_Timeframe),
           " | magic=", Magic_Number,
           " | max_pos=", Max_Open_Positions, " | portfolio=", Portfolio_Max_Risk_Pct, "%"
-          " | risk=", Risk_Per_Trade_Pct, "% | TP=", TP_R_Multiple, "R"
-          " | SL_mult=", SL_ATR_Mult,
-          " | partial=", Partial_Close_Ratio*100, "% @+", Partial_Close_At_R, "R"
+          " | risk=", Risk_Per_Trade_Pct, "% | SL_mult=", SL_ATR_Mult,
+          " | BE@", BE_Trigger_R, "R(buf ", BE_Buffer_Pips, "p", (BE_Cost_Buffer ? "+spread" : ""), ")",
+          " | stage1 ", TP1_Close_Pct, "%@", TP1_R, "R",
+          " | stage2 ", TP2_Close_Pct, "%@", TP2_R, "R",
+          " | runner trail ATRx", Runner_Trail_ATR_Mult, " from ", Runner_Trail_Start_R, "R",
           " | CB_reset=", CB_Reset_Ratio);
     return INIT_SUCCEEDED;
 }
@@ -589,6 +635,8 @@ void OpenTrade(string sym, string dir, int sc, double rsi, double adx,
     ulong ticket = res.order; // position ticket = opening order ticket
     MarkOpenedSymbol(sym);
     SaveSlDist(sym, sl_dist);
+    SaveOrigLot(sym, lots);       // V19.1: stage-1/2 closes are a % of this
+    ClearExitStage(sym);          // fresh position → stage 0
 
     string msg = StringFormat("[Trade OPEN] %s %s | lots=%.2f price=%.5f SL=%.5f TP=%.5f"
                               " (%.1fR) atr=%.5f risk=%.1f%% ticket=%lld",
@@ -600,174 +648,178 @@ void OpenTrade(string sym, string dir, int sc, double rsi, double adx,
 }
 
 // ── Trade management ──────────────────────────────────────────────────
+// Close `close_lot` of an open position at market. Returns true on send OK.
+bool ClosePartOfPosition(ulong ticket, string sym, ENUM_POSITION_TYPE pos_type,
+                         double cur, double close_lot) {
+    MqlTradeRequest req = {}; MqlTradeResult res = {};
+    req.action       = TRADE_ACTION_DEAL;
+    req.position     = ticket;
+    req.symbol       = sym;
+    req.volume       = close_lot;
+    req.type         = (pos_type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+    req.price        = cur;
+    req.deviation    = Slippage;
+    req.magic        = Magic_Number;
+    req.type_filling = GetFilling(sym);
+    return OrderSend(req, res);
+}
+
+// V19.1 staged exit ladder (memo §3–§6):
+//   r >= BE_Trigger_R  → SL to break-even (+ BE_Buffer_Pips, + live spread if BE_Cost_Buffer)
+//   stage 0, r >= TP1_R → close TP1_Close_Pct% of ORIGINAL lot, SL→BE,  stage=1
+//   stage 1, r >= TP2_R → close TP2_Close_Pct% of ORIGINAL lot, SL→+1R, stage=2
+//   stage 2 (runner)    → ATR trail (Runner_Trail_ATR_Mult) blended with step-SL,
+//                         plus the ADX/EMA10-20 trend-weakening tighten / full close
+//                         and TP-extend (all carried over from v1.12).
 void ManageOpenTrades() {
     for (int i = PositionsTotal()-1; i >= 0; i--) {
         ulong ticket = PositionGetTicket(i);
         if (ticket == 0) continue;
         if (PositionGetInteger(POSITION_MAGIC) != Magic_Number) continue;
 
-        string sym     = PositionGetString(POSITION_SYMBOL);
+        string sym  = PositionGetString(POSITION_SYMBOL);
         ENUM_POSITION_TYPE pos_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-        double entry   = PositionGetDouble(POSITION_PRICE_OPEN);
-        double sl      = PositionGetDouble(POSITION_SL);
-        double tp      = PositionGetDouble(POSITION_TP);
-        double lots    = PositionGetDouble(POSITION_VOLUME);
-        double cur     = (pos_type == POSITION_TYPE_BUY) ?
-                         SymbolInfoDouble(sym, SYMBOL_BID) :
-                         SymbolInfoDouble(sym, SYMBOL_ASK);
+        bool   is_buy = (pos_type == POSITION_TYPE_BUY);
+        double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+        double sl    = PositionGetDouble(POSITION_SL);
+        double tp    = PositionGetDouble(POSITION_TP);
+        double lots  = PositionGetDouble(POSITION_VOLUME);
+        double cur   = is_buy ? SymbolInfoDouble(sym, SYMBOL_BID)
+                              : SymbolInfoDouble(sym, SYMBOL_ASK);
+
         double sl_dist_cur = MathAbs(entry - sl);
         if (sl_dist_cur == 0) continue;
         double sl_dist = LoadSlDist(sym, sl_dist_cur);
-        double r  = (pos_type == POSITION_TYPE_BUY) ? (cur - entry) / sl_dist : (entry - cur) / sl_dist;
+        double r  = is_buy ? (cur - entry) / sl_dist : (entry - cur) / sl_dist;
         double ps = (StringFind(sym, "JPY") >= 0) ? 0.01 : 0.0001;
+        double min_lot  = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
+        double lot_step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+        if (lot_step <= 0) lot_step = 0.01;
+        double orig_lot = LoadOrigLot(sym, lots);
+        int    stage    = GetExitStage(sym);
 
-        // Breakeven
-        double be_sl = (pos_type == POSITION_TYPE_BUY) ?
-                       entry + ps * BE_Buffer_Pips : entry - ps * BE_Buffer_Pips;
-        bool be_set = (pos_type == POSITION_TYPE_BUY) ?
-                      (sl >= be_sl - ps * 0.1) : (sl <= be_sl + ps * 0.1);
-        if (r >= 1.0 && !be_set)
-            if (ModifySLTP(ticket, sym, be_sl, tp) && Debug)
-                Print("[Mgr] BE moved ticket=", ticket);
-
-        // Partial close at +2R
-        if (r >= Partial_Close_At_R && !IsSymbolPartialClosed(sym)) {
-            double min_lot = SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN);
-            if (lots <= min_lot * 1.5) {
-                MarkSymbolPartialClosed(sym);
-                if (Debug) Print("[Mgr] Lot too small, skip partial — ", sym);
-            } else {
-                double close_lot = NormalizeDouble(lots * Partial_Close_Ratio, 2);
-                close_lot = MathMax(close_lot, min_lot);
-                MarkSymbolPartialClosed(sym);
-
-                MqlTradeRequest req = {}; MqlTradeResult res = {};
-                req.action       = TRADE_ACTION_DEAL;
-                req.position     = ticket;
-                req.symbol       = sym;
-                req.volume       = close_lot;
-                req.type         = (pos_type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-                req.price        = cur;
-                req.deviation    = Slippage;
-                req.magic        = Magic_Number;
-                req.type_filling = GetFilling(sym);
-
-                if (OrderSend(req, res)) {
-                    // MT5: position ticket unchanged after partial close — no remainder registration needed
-                    double sl_1r = (pos_type == POSITION_TYPE_BUY) ?
-                                   entry + sl_dist : entry - sl_dist;
-                    bool sl_ok = (pos_type == POSITION_TYPE_BUY) ? (sl_1r > sl) : (sl_1r < sl || sl == 0);
-                    if (sl_ok)
-                        if (ModifySLTP(ticket, sym, sl_1r, tp) && Debug)
-                            Print("[Mgr] Partial 30% SL→+1R ticket=", ticket,
-                                  " sl_1r=", DoubleToString(sl_1r, 5));
-                    string msg = StringFormat("[Trade PARTIAL] ticket=%lld %s 30%% @ %.5f | SL→+1R",
-                                              (long)ticket, sym, cur);
-                    if (Debug) Print(msg); SendTelegram(msg);
-                } else {
-                    Print("[Mgr] Partial failed ", sym, " ticket=", ticket, " err=", GetLastError());
-                    ClearSymbolPartialClosed(sym);
-                }
+        // ── Break-even (memo §5 / §18) ─────────────────────────────
+        double spread_px = SymbolInfoInteger(sym, SYMBOL_SPREAD) * SymbolInfoDouble(sym, SYMBOL_POINT);
+        double be_buffer = ps * BE_Buffer_Pips + (BE_Cost_Buffer ? spread_px : 0.0);
+        double be_sl = is_buy ? entry + be_buffer : entry - be_buffer;
+        bool be_set  = is_buy ? (sl >= be_sl - ps * 0.1) : (sl <= be_sl + ps * 0.1);
+        // guard: only (re)set BE when it actually improves SL by > 0.3 pip — avoids
+        // per-tick SL churn as the live spread wobbles the buffer.
+        bool be_improves = is_buy ? (be_sl > sl + ps * 0.3) : (be_sl < sl - ps * 0.3);
+        if (r >= BE_Trigger_R && !be_set && be_improves) {
+            if (ModifySLTP(ticket, sym, be_sl, tp)) {
+                sl = be_sl; be_set = true;
+                if (Debug) Print("[Mgr] BE ticket=", ticket, " SL=", DoubleToString(be_sl, 5));
             }
         }
 
-        // Production-grade trend-exit management after partial close
-        if (IsSymbolPartialClosed(sym) && r >= Partial_Close_At_R) {
-            // Re-read SL/TP/volume in case a partial close just fired above (same tick)
+        // ── Stage 1 — scale out TP1% at +TP1_R, lock SL at BE ──────
+        if (stage == 0 && r >= TP1_R) {
+            double want = MathFloor(orig_lot * (TP1_Close_Pct / 100.0) / lot_step) * lot_step;
+            want = MathMin(want, lots - min_lot);            // keep a tradeable remainder
+            if (want >= min_lot && ClosePartOfPosition(ticket, sym, pos_type, cur, want)) {
+                SetExitStage(sym, 1); stage = 1;
+                if (PositionSelectByTicket(ticket)) {
+                    sl = PositionGetDouble(POSITION_SL); tp = PositionGetDouble(POSITION_TP);
+                    lots = PositionGetDouble(POSITION_VOLUME);
+                }
+                if (!be_set && ModifySLTP(ticket, sym, be_sl, tp)) sl = be_sl;
+                string m = StringFormat("[Trade PARTIAL 1/2] %s ticket=%lld -%.2f @%.5f (+%.2fR) SL->BE",
+                                        sym, (long)ticket, want, cur, r);
+                if (Debug) Print(m); SendTelegram(m);
+            } else {
+                SetExitStage(sym, 1); stage = 1;            // lot too small to split — just advance
+                if (want < min_lot && Debug) Print("[Mgr] Stage1 skip close (lot too small) ", sym);
+                else if (Debug) Print("[Mgr] Stage1 partial failed ", sym, " err=", GetLastError());
+            }
+        }
+
+        // ── Stage 2 — scale out TP2% at +TP2_R, SL → +1R ───────────
+        if (stage == 1 && r >= TP2_R) {
+            double want  = MathFloor(orig_lot * (TP2_Close_Pct / 100.0) / lot_step) * lot_step;
+            want = MathMin(want, lots - min_lot);
+            double sl_1r = is_buy ? entry + sl_dist : entry - sl_dist;
+            bool closed = (want >= min_lot && ClosePartOfPosition(ticket, sym, pos_type, cur, want));
+            if (closed || want < min_lot) {
+                SetExitStage(sym, 2); stage = 2;
+                if (PositionSelectByTicket(ticket)) {
+                    sl = PositionGetDouble(POSITION_SL); tp = PositionGetDouble(POSITION_TP);
+                    lots = PositionGetDouble(POSITION_VOLUME);
+                }
+                bool sl_ok = is_buy ? (sl_1r > sl) : (sl_1r < sl || sl == 0);
+                if (sl_ok && ModifySLTP(ticket, sym, sl_1r, tp)) sl = sl_1r;
+                if (closed) {
+                    string m = StringFormat("[Trade PARTIAL 2/2] %s ticket=%lld -%.2f @%.5f (+%.2fR) SL->+1R runner=%.2f",
+                                            sym, (long)ticket, want, cur, r, lots);
+                    if (Debug) Print(m); SendTelegram(m);
+                } else if (Debug) Print("[Mgr] Stage2 skip close (lot too small), SL->+1R ", sym);
+            } else if (Debug) {
+                Print("[Mgr] Stage2 partial failed ", sym, " err=", GetLastError());
+            }
+        }
+
+        // ── Runner (stage 2) — ATR trail + trend-weakening exit ────
+        if (stage == 2 && r >= Runner_Trail_Start_R) {
             if (PositionSelectByTicket(ticket)) {
-                sl   = PositionGetDouble(POSITION_SL);
-                tp   = PositionGetDouble(POSITION_TP);
+                sl = PositionGetDouble(POSITION_SL); tp = PositionGetDouble(POSITION_TP);
                 lots = PositionGetDouble(POSITION_VOLUME);
             }
             double atr_cur = GetATR(sym, 0);
 
-            // ── Trend strength indicators ────────────────────────────
             double adx_cur    = GetADX(sym, 0);
             double ema10_cur  = GetMA(ma10_handles, sym, 0);
             double ema20_cur  = GetMA(ma20_handles, sym, 0);
             double ema10_prev = GetMA(ma10_handles, sym, 1);
             double ema20_prev = GetMA(ma20_handles, sym, 1);
 
-            // EMA10/20 cross-back detection
-            // BUY: ema10 was above ema20, now crossed below → momentum lost
-            bool ema_cross_back = false;
-            if (pos_type == POSITION_TYPE_BUY)
-                ema_cross_back = (ema10_prev >= ema20_prev) && (ema10_cur < ema20_cur);
-            else
-                ema_cross_back = (ema10_prev <= ema20_prev) && (ema10_cur > ema20_cur);
-
+            bool ema_cross_back = is_buy
+                ? (ema10_prev >= ema20_prev) && (ema10_cur < ema20_cur)
+                : (ema10_prev <= ema20_prev) && (ema10_cur > ema20_cur);
             bool adx_weak  = adx_cur < 25.0;
             bool adx_dying = adx_cur < 20.0;
 
-            // ── Production Grade Exit Logic ──────────────────────────
-            // Case 1: ADX<20 AND EMA cross-back → Runner Full Close
+            // Case 1: ADX<20 AND EMA cross-back at >=3R → close the runner
             if (adx_dying && ema_cross_back && r >= 3.0) {
-                MqlTradeRequest creq = {}; MqlTradeResult cres = {};
-                creq.action       = TRADE_ACTION_DEAL;
-                creq.position     = ticket;
-                creq.symbol       = sym;
-                creq.volume       = lots;
-                creq.type         = (pos_type == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-                creq.price        = cur;
-                creq.deviation    = Slippage;
-                creq.magic        = Magic_Number;
-                creq.type_filling = GetFilling(sym);
-                if (OrderSend(creq, cres)) {
-                    string msg = StringFormat("[Mgr] RUNNER CLOSE ticket=%lld %s"
-                        " r=%.2f ADX=%.1f EMA-crossback → trend ended",
-                        (long)ticket, sym, r, adx_cur);
-                    if (Debug) Print(msg); SendTelegram(msg);
+                if (ClosePartOfPosition(ticket, sym, pos_type, cur, lots)) {
+                    string m = StringFormat("[Mgr] RUNNER CLOSE %s ticket=%lld r=%.2f ADX=%.1f EMA-crossback",
+                                            sym, (long)ticket, r, adx_cur);
+                    if (Debug) Print(m); SendTelegram(m);
                 }
                 continue;
             }
 
-            // Case 2: ADX<25 OR EMA cross-back → Tighten to ATR×0.5
-            double atr_mult = SL_ATR_Mult;  // default (1.5 or 2.0)
+            // Case 2: ADX<25 OR EMA cross-back → tighten the trail to ATR×0.5
+            double trail_mult = Runner_Trail_ATR_Mult;
             if (adx_weak || ema_cross_back) {
-                atr_mult = 0.5;  // tighten — trend weakening
-                if (Debug) Print("[Mgr] Tighten ATR×0.5 ticket=", ticket,
-                                 " ADX=", DoubleToString(adx_cur, 1),
-                                 " cross_back=", ema_cross_back);
+                trail_mult = 0.5;
+                if (Debug) Print("[Mgr] Tighten trail ATR x0.5 ticket=", ticket,
+                                 " ADX=", DoubleToString(adx_cur, 1), " xback=", ema_cross_back);
             }
 
-            // ── SL = max(CurrentR-1, ATR trail) ─────────────────────
-            int    r_floor = (int)MathFloor(r);
-            if (r_floor < (int)Partial_Close_At_R) r_floor = (int)Partial_Close_At_R;
-            double step_sl = (pos_type == POSITION_TYPE_BUY)
-                              ? entry + (r_floor - 1) * sl_dist
-                              : entry - (r_floor - 1) * sl_dist;
+            int r_floor = (int)MathFloor(r);
+            int r_min   = (int)MathCeil(TP2_R);
+            if (r_floor < r_min) r_floor = r_min;
+            double step_sl = is_buy ? entry + (r_floor - 1) * sl_dist
+                                    : entry - (r_floor - 1) * sl_dist;
             double atr_sl  = (atr_cur > 0)
-                              ? ((pos_type == POSITION_TYPE_BUY) ? cur - atr_cur * atr_mult
-                                                                  : cur + atr_cur * atr_mult)
+                              ? (is_buy ? cur - atr_cur * trail_mult : cur + atr_cur * trail_mult)
                               : step_sl;
-            double target_sl = (pos_type == POSITION_TYPE_BUY)
-                                ? MathMax(step_sl, atr_sl)
-                                : MathMin(step_sl, atr_sl);
+            double target_sl = is_buy ? MathMax(step_sl, atr_sl) : MathMin(step_sl, atr_sl);
 
-            bool should_move = (pos_type == POSITION_TYPE_BUY) ?
-                               (target_sl > sl) : (target_sl < sl || sl == 0);
-            if (should_move) {
-                if (ModifySLTP(ticket, sym, target_sl, tp) && Debug)
-                    Print("[Mgr] Trail ticket=", ticket,
-                          " r=", DoubleToString(r, 2),
-                          " step_sl=", DoubleToString(step_sl, 5),
-                          " atr_sl=", DoubleToString(atr_sl, 5),
-                          " mult=", DoubleToString(atr_mult, 1),
-                          " → SL=", DoubleToString(target_sl, 5));
+            bool should_move = is_buy ? (target_sl > sl) : (target_sl < sl || sl == 0);
+            if (should_move && ModifySLTP(ticket, sym, target_sl, tp)) {
                 sl = target_sl;
+                if (Debug) Print("[Mgr] Trail ticket=", ticket, " r=", DoubleToString(r, 2),
+                                 " -> SL=", DoubleToString(target_sl, 5),
+                                 " (mult=", DoubleToString(trail_mult, 1), ")");
             }
 
-            // ── TP extend ────────────────────────────────────────────
-            double cur_tp  = tp;
-            double new_tp  = (pos_type == POSITION_TYPE_BUY)
-                              ? entry + (r_floor + 1) * sl_dist
-                              : entry - (r_floor + 1) * sl_dist;
-            bool tp_behind = (pos_type == POSITION_TYPE_BUY) ?
-                             (cur >= cur_tp - ps) : (cur <= cur_tp + ps);
-            if (tp_behind && MathAbs(new_tp - cur_tp) > ps) {
-                if (ModifySLTP(ticket, sym, sl, new_tp) && Debug)
-                    Print("[Mgr] TP extended ticket=", ticket,
-                          " new_tp=", DoubleToString(new_tp, 5));
+            // TP extend — keep the runner's TP ahead of price
+            double new_tp = is_buy ? entry + (r_floor + 1) * sl_dist
+                                   : entry - (r_floor + 1) * sl_dist;
+            bool tp_behind = is_buy ? (cur >= tp - ps) : (cur <= tp + ps);
+            if (tp_behind && MathAbs(new_tp - tp) > ps && ModifySLTP(ticket, sym, sl, new_tp)) {
+                if (Debug) Print("[Mgr] TP extended ticket=", ticket, " new_tp=", DoubleToString(new_tp, 5));
             }
         }
     }
@@ -809,14 +861,26 @@ void Level2ProtectTrades() {
             }
             continue;
         }
+        // memo §5: do NOT move to BE before +BE_Trigger_R even in defensive mode —
+        // an early BE just gets stopped out on a normal retracement while the trend
+        // continues without us. Winners below that R keep their original SL; the L3
+        // circuit breaker still closes everything if the drawdown deepens.
         double ps = (StringFind(sym, "JPY") >= 0) ? 0.01 : 0.0001;
-        double be_sl = (pos_type == POSITION_TYPE_BUY) ?
-                       entry + ps * BE_Buffer_Pips : entry - ps * BE_Buffer_Pips;
+        double sl_dist = LoadSlDist(sym, MathAbs(entry - sl));
+        double r = (sl_dist > 0)
+                   ? ((pos_type == POSITION_TYPE_BUY) ? (cur - entry) / sl_dist
+                                                       : (entry - cur) / sl_dist)
+                   : 0.0;
+        if (r < BE_Trigger_R) continue;
+
+        double spread_px = SymbolInfoInteger(sym, SYMBOL_SPREAD) * SymbolInfoDouble(sym, SYMBOL_POINT);
+        double be_buffer = ps * BE_Buffer_Pips + (BE_Cost_Buffer ? spread_px : 0.0);
+        double be_sl = (pos_type == POSITION_TYPE_BUY) ? entry + be_buffer : entry - be_buffer;
         bool be_set = (pos_type == POSITION_TYPE_BUY) ?
                       (sl >= be_sl - ps * 0.1) : (sl <= be_sl + ps * 0.1);
         if (!be_set)
             if (ModifySLTP(ticket, sym, be_sl, tp) && Debug)
-                Print("[CB-L2] BE set ticket=", ticket);
+                Print("[CB-L2] BE set ticket=", ticket, " r=", DoubleToString(r, 2));
     }
 }
 
@@ -898,7 +962,9 @@ void DetectAndReportClosedTrades() {
         if (PositionSelectByTicket(pos_id)) continue;
 
         string sym = HistoryDealGetString(deal_ticket, DEAL_SYMBOL);
-        if (!HasOpenPosition(sym)) { ClearSymbolPartialClosed(sym); ClearOpenedSymbol(sym); ClearSlDist(sym); }
+        if (!HasOpenPosition(sym)) {
+            ClearExitStage(sym); ClearOrigLot(sym); ClearOpenedSymbol(sym); ClearSlDist(sym);
+        }
 
         // Aggregate ALL out-deals for this position (handles partial closes)
         double total_profit = 0, total_commission = 0, total_swap = 0;

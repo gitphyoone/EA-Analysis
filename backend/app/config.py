@@ -91,6 +91,24 @@ class Settings(BaseSettings):
     max_open_positions: int = 3
     atr_min_threshold: float = 0.0005     # ignore entries in dead market
 
+    # =========================================================
+    # V19.1 — RE-ENTRY / DAILY-LOSS GUARDS (memo V19.1, RED list)
+    # =========================================================
+    # memo §9  — after an SL, block ANY new entry on the same symbol for N minutes
+    #            (kills the "SL → seconds later → re-entry → SL" churn)
+    sl_cooldown_minutes: int = 30
+
+    # memo §11 — if the last trade on a symbol was an SL in the SAME direction,
+    #            wait for a fresh H1 candle to close before re-entering that
+    #            direction (confirmation candle). Set False to disable.
+    reentry_wait_new_candle: bool = True
+
+    # memo §16 — once today's REALISED loss reaches this % of equity, stop opening
+    #            NEW trades for the rest of the day. Existing positions keep their
+    #            normal exit management (this is a soft gate, not the circuit
+    #            breaker). Set to 100 to disable.
+    daily_loss_limit_pct: float = 2.0
+
     # FIX 8: break-even buffer — exact entry = stop-hunt target
     # 1 pip buffer prevents false stop-out on broker spike
     be_buffer_pips: float = 1.0

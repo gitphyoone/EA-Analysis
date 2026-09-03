@@ -11,10 +11,12 @@ import pytz
 from ..database import get_db
 from ..models.market_data import MarketData
 from ..models.trade import TradeHistory
+from ..models.account import AccountSnapshot
 from ..schemas.signal import SignalResult, CircuitBreakerState
 from ..engines.signal_engine import SignalEngine
 from ..engines.risk_engine import RiskEngine
 from ..engines.session_engine import SessionEngine
+from ..engines.pretrade_engine import PretradeEngine
 from ..config import get_settings
 from ..auth import verify_api_key
 from ..services.signal_log_service import SignalLogService
@@ -103,10 +105,63 @@ async def evaluate_signal(
         signal.direction = "NO_TRADE"
         signal.reject_reason = "FRIDAY_CLOSE" if session_engine.is_friday_close(now_utc) else "OFF_SESSION"
 
+    # ── V19.1 pre-trade guards (re-entry cooldown / daily-loss soft stop) ──
+    # Only ever downgrades a live BUY/SELL to NO_TRADE — never creates a signal.
+    if signal.direction in ("BUY", "SELL"):
+        reason = await _pretrade_block_reason(db, settings, symbol, signal.direction, candle.timestamp)
+        if reason is not None:
+            signal.direction = "NO_TRADE"
+            signal.reject_reason = reason
+
     session_name = session_engine.get_session(now_utc)
     await SignalLogService().log(db, signal, session=session_name)
 
     return signal
+
+
+async def _pretrade_block_reason(db, settings, symbol, direction, latest_h1_candle_ts):
+    """Returns a RejectReason string if a V19.1 re-entry/daily-loss guard blocks the
+    trade, else None. See engines/pretrade_engine.py."""
+    # Recent closed trades for this symbol (newest first) — uses idx_trade_history_symbol
+    th_rows = (await db.execute(
+        select(TradeHistory.exit_reason, TradeHistory.direction, TradeHistory.closed_at)
+        .where(TradeHistory.symbol == symbol)
+        .order_by(TradeHistory.closed_at.desc())
+        .limit(3)
+    )).all()
+    last_trades = [
+        {"exit_reason": r.exit_reason, "direction": r.direction, "closed_at": r.closed_at}
+        for r in th_rows
+    ]
+
+    # Today's realised loss (JST day), same shape as analytics.drawdown
+    today_jst = datetime.now(JST).date()
+    day_start = datetime(today_jst.year, today_jst.month, today_jst.day, tzinfo=JST)
+    daily_loss = (await db.execute(
+        select(func.coalesce(func.sum(TradeHistory.net_pnl), 0))
+        .where(TradeHistory.closed_at >= day_start)
+        .where(TradeHistory.net_pnl < 0)
+    )).scalar() or Decimal(0)
+
+    snap = await db.get(AccountSnapshot, 1)
+    equity = snap.equity if snap else None
+
+    decision = PretradeEngine(settings).check(
+        symbol=symbol,
+        direction=direction,
+        last_trades=last_trades,
+        latest_h1_candle_ts=latest_h1_candle_ts,
+        now=datetime.now(timezone.utc),
+        daily_realized_loss=daily_loss,
+        equity=equity,
+    )
+    if not decision.allowed:
+        import logging
+        logging.getLogger("ea.signals").info(
+            "pre-trade block %s %s → %s (%s)", symbol, direction, decision.reason, decision.detail
+        )
+        return decision.reason
+    return None
 
 
 @router.get("/circuit-breaker", response_model=CircuitBreakerState)

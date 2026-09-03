@@ -19,6 +19,9 @@ RejectReason = Literal[
     "MULTI_CONDITION_FAIL", # 2+ conditions failed — no single dominant reason
     "OFF_SESSION",          # Outside allowed trading session window
     "FRIDAY_CLOSE",         # Friday close — new entries blocked before weekend
+    "SL_COOLDOWN",          # V19.1 §9  — same symbol stopped out < cooldown ago
+    "REENTRY_WAIT_CANDLE",  # V19.1 §11 — same-dir re-entry waiting for next H1 close
+    "DAILY_LOSS_LIMIT",     # V19.1 §16 — today's realised loss hit the daily soft stop
 ]
 
 
