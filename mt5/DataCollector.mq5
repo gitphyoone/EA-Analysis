@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT5 Data Collector v1.01                     |
+//| V19 FX Prop Desk — MT5 Data Collector v1.02                     |
 //| Ported from MT4 DataCollector v1.00                             |
 //| Collects H1 OHLCV + EMA10/20/50/200, RSI14, ADX14, ATR14       |
 //| Sends to FastAPI via WebRequest                                  |
@@ -23,18 +23,36 @@
 //|  - FIX D: CollectOnTick input added to match MT4's on/off       |
 //|    toggle. MT5's OnTick() previously called CollectAll()        |
 //|    unconditionally with no way to disable it.                   |
-//|  - NOTE (not fixed here, unconfirmed): Symbol_List uses plain   |
-//|    "USDJPY" while MT4 uses "USDJPY.y" (broker suffix). Verify   |
-//|    against this MT5 account's actual Market Watch symbol name.  |
+//|  - RESOLVED (v1.02): Symbol_List "USDJPY" vs MT4 "USDJPY.y" —   |
+//|    confirmed this broker's Market Watch symbol is plain         |
+//|    "USDJPY" (no suffix), so no mismatch. USDJPY removed from    |
+//|    Symbol_List anyway — backtest (chat, 2026-10) showed it's a  |
+//|    net-negative pair for V19's signal engine regardless of      |
+//|    symbol-name correctness (score=9 USDJPY trades were the      |
+//|    worst-performing bucket, not just low-score ones).           |
+//| v1.02 — H1/H4 logic-parity fix:                                  |
+//|  - FIX F: market_data.timeframe was hardcoded to the literal     |
+//|    "H1" in CollectAndSend()'s JSON body, ignoring the Timeframe  |
+//|    input entirely. A second instance of this EA attached with   |
+//|    Timeframe=PERIOD_H4 (for the TradeExecutor H4 instance) was   |
+//|    silently mislabeling its candles as "H1" in the backend —     |
+//|    routers/signals.py's evaluate_signal() queries               |
+//|    MarketData.timeframe=="H4" for the H4 TradeExecutor instance, |
+//|    which would find nothing (404) or, worse, find H1 rows if a   |
+//|    naive query omitted the filter. Added TFToString() (ported    |
+//|    from TradeExecutor.mq5) and now send TFToString(Timeframe)    |
+//|    instead of the "H1" literal. To run an H4 collector instance  |
+//|    alongside H1: attach this EA to a second chart with           |
+//|    Timeframe=PERIOD_H4 — Symbol_List can stay the same.          |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.01"
+#property version   "1.02"
 
 // ── Inputs ──────────────────────────────────────────────────────────
 input string             FastAPI_URL        = "http://127.0.0.1/data/candle";
 input string             FastAPI_AccountURL = "http://127.0.0.1/data/account";
 input string             API_Key            = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string              Symbol_List        = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,NZDUSD,USDCHF,EURGBP";
+input string              Symbol_List        = "EURUSD,GBPUSD,AUDUSD,USDCAD,GBPJPY,NZDUSD,USDCHF,EURGBP";  // FIX (chat, 2026-10): USDJPY removed — net-negative pair
 input ENUM_TIMEFRAMES    Timeframe          = PERIOD_H1;
 input bool               CollectOnTick      = true;   // FIX D (v1.01): matches MT4's toggle
 input bool               Debug              = true;
@@ -66,6 +84,23 @@ double GetBuf(int handle, int buf_idx, int shift) {
     double buf[1];
     if (CopyBuffer(handle, buf_idx, shift, 1, buf) != 1) return 0.0;
     return buf[0];
+}
+// FIX F (v1.02): ported from TradeExecutor.mq5 — maps Timeframe input to the
+// string the backend's market_data.timeframe column expects, so an H4
+// collector instance no longer mislabels its candles as "H1".
+string TFToString(ENUM_TIMEFRAMES tf) {
+    switch (tf) {
+        case PERIOD_M1:  return "M1";
+        case PERIOD_M5:  return "M5";
+        case PERIOD_M15: return "M15";
+        case PERIOD_M30: return "M30";
+        case PERIOD_H1:  return "H1";
+        case PERIOD_H4:  return "H4";
+        case PERIOD_D1:  return "D1";
+        case PERIOD_W1:  return "W1";
+        case PERIOD_MN1: return "MN1";
+        default:         return "H1";
+    }
 }
 
 // ── OnInit ────────────────────────────────────────────────────────────
@@ -103,8 +138,8 @@ int OnInit() {
     }
     num_symbols = n;
     EventSetTimer(60);
-    Print("[DataCollector MT5 v1.01] Initialized | symbols=", Symbol_List,
-          " | timeframe=", EnumToString(Timeframe),
+    Print("[DataCollector MT5 v1.02] Initialized | symbols=", Symbol_List,
+          " | timeframe=", TFToString(Timeframe),
           " | CollectOnTick=", CollectOnTick);
     return INIT_SUCCEEDED;
 }
@@ -178,7 +213,7 @@ void CollectAndSend(int idx, string sym) {
     string body = StringFormat(
         "{"
         "\"symbol\":\"%s\","
-        "\"timeframe\":\"H1\","
+        "\"timeframe\":\"%s\","                                 // FIX F (v1.02): was hardcoded "H1"
         "\"timestamp\":\"%s\","
         "\"open\":%.6f,"
         "\"high\":%.6f,"
@@ -198,57 +233,3 @@ void CollectAndSend(int idx, string sym) {
         "\"atr14\":%.6f"
         "}",
         sym,
-        FormatTimestamp(time_buf[0]),
-        open_buf[0], high_buf[0], low_buf[0], close_buf[0],
-        vol_buf[0],
-        ema10, ema20, ema50, ema200,
-        ema50_prev, ema200_prev,
-        rsi, adx, di_p, di_m, atr
-    );
-
-    string headers = "Content-Type: application/json\r\n";
-    if (StringLen(API_Key) > 0)
-        headers += "X-API-Key: " + API_Key + "\r\n";
-
-    uchar post_data[], result[];
-    string result_headers;
-    StringToCharArray(body, post_data, 0, StringLen(body));
-    int res = WebRequest("POST", FastAPI_URL, headers, 5000, post_data, result, result_headers);
-
-    if (Debug) {
-        if (res == 201 || res == 200)
-            Print("[DataCollector] OK ", sym, " | ", FormatTimestamp(time_buf[0]),
-                  " ema10=", DoubleToString(ema10,5),
-                  " ema20=", DoubleToString(ema20,5),
-                  " ema50_slope=", DoubleToString(ema50-ema50_prev,6),
-                  " ema200_slope=", DoubleToString(ema200-ema200_prev,6));
-        else
-            Print("[DataCollector] FAIL ", sym, " HTTP=", res,
-                  " body=", CharArrayToString(result));
-    }
-}
-
-// ── Account snapshot ──────────────────────────────────────────────────
-void SendAccountSnapshot() {
-    string body = StringFormat(
-        "{\"equity\":%.2f,\"balance\":%.2f}",
-        AccountInfoDouble(ACCOUNT_EQUITY),
-        AccountInfoDouble(ACCOUNT_BALANCE)
-    );
-
-    string headers = "Content-Type: application/json\r\n";
-    if (StringLen(API_Key) > 0)
-        headers += "X-API-Key: " + API_Key + "\r\n";
-
-    uchar post_data[], result[];
-    string result_headers;
-    StringToCharArray(body, post_data, 0, StringLen(body));
-    int res = WebRequest("POST", FastAPI_AccountURL, headers, 5000, post_data, result, result_headers);
-
-    if (Debug) {
-        if (res == 200)
-            Print("[DataCollector] AccountSnapshot OK equity=", AccountInfoDouble(ACCOUNT_EQUITY));
-        else
-            Print("[DataCollector] AccountSnapshot FAIL HTTP=", res);
-    }
-}

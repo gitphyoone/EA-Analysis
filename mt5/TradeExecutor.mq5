@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| V19 FX Prop Desk — MT5 Trade Executor v1.12                     |
+//| V19 FX Prop Desk — MT5 Trade Executor v1.14                     |
 //| Ported from MT4 TradeExecutor v2.10                             |
 //|                                                                  |
 //| MQL4→MQL5 key changes:                                          |
@@ -31,10 +31,10 @@
 //|    GetATR() default (shift=1, previous closed bar) to an        |
 //|    explicit shift=0 (current/live bar), matching MT4's          |
 //|    iATR(sym,60,14,0) in the same function.                      |
-//|  - NOTE (not fixed here, unconfirmed): Symbol_List uses plain   |
-//|    "USDJPY" while MT4 uses "USDJPY.y" (broker suffix). Verify   |
-//|    against this MT5 account's actual Market Watch symbol name   |
-//|    before relying on USDJPY signals/trades.                     |
+//|  - RESOLVED (v1.14): Symbol_List "USDJPY" vs MT4 "USDJPY.y" —   |
+//|    confirmed this broker's Market Watch symbol is plain         |
+//|    "USDJPY", no mismatch. USDJPY removed from Symbol_List       |
+//|    anyway (see v1.14 note below).                               |
 //| CONFIRMED (chat): switching SL_ATR_Mult 2.0→1.5 and             |
 //|    Partial_Close_At_R 4.0→2.0 fixed step-trail on H1 — but the  |
 //|    underlying data source was still hardcoded to H1 regardless  |
@@ -72,20 +72,31 @@
 //|    and position/history filtering are all keyed by symbol+magic,|
 //|    so the two instances won't interfere with each other even    |
 //|    when trading the same symbols.                                |
-//|  - NOT verified here: whether the backend's /signals/evaluate    |
-//|    endpoint and market_data table actually distinguish H1 vs    |
-//|    H4 rows. DataCollector must also be run as a second H4       |
-//|    instance (see DataCollector.mq5 v1.02) for this to work end-  |
-//|    to-end — check backend routers/signals.py if H4 signals      |
-//|    come back empty or identical to H1.                          |
+//| v1.14 — H1/H4 TradeHistory fix + USDJPY removed:                 |
+//|  - FIX G: NotifyBackend() now sends "timeframe":"H1"/"H4" in the |
+//|    /trades/open JSON body (via TFToString(Signal_Timeframe)).    |
+//|    Previously the backend's TradeHistory table had no timeframe  |
+//|    column at all, so routers/signals.py's                       |
+//|    _pretrade_block_reason() queried "last 3 closed trades for    |
+//|    this symbol" across BOTH H1 and H4 instances — an H4 trade's  |
+//|    SL could wrongly trigger REENTRY_WAIT_CANDLE on the H1        |
+//|    instance's next signal for the same symbol, and vice versa.   |
+//|    Requires matching backend changes (models/trade.py,           |
+//|    schemas/trade.py, routers/trades.py, routers/signals.py — DB  |
+//|    migration adds a timeframe column to trades/trade_history).   |
+//|  - USDJPY removed from Symbol_List: backtest (chat, 2026-10)     |
+//|    showed it net-negative across every window tested (Aug full-  |
+//|    month PF 0.73, Sep backtest -$2,152, live Sep30-Oct05 window  |
+//|    -$1,709) — including at score=9 (max score), ruling out a     |
+//|    simple score-threshold fix.                                   |
 //+------------------------------------------------------------------+
 #property copyright "V19 FX Prop Desk"
-#property version   "1.13"
+#property version   "1.14"
 
 // ── Inputs ──────────────────────────────────────────────────────────
 input string           FastAPI_Base         = "http://127.0.0.1";
 input string           API_Key              = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string            Symbol_List          = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,NZDUSD,USDCHF,EURGBP";
+input string            Symbol_List          = "EURUSD,GBPUSD,AUDUSD,USDCAD,GBPJPY,NZDUSD,USDCHF,EURGBP";  // v1.14: USDJPY removed
 input ENUM_TIMEFRAMES   Signal_Timeframe     = PERIOD_H1;  // FIX E (v1.12): drives indicators + signal URL + reject-log
 input int               Poll_Seconds         = 10;
 input long              Magic_Number         = 19001;      // MUST differ between the H1 and H4 instances
@@ -423,7 +434,7 @@ int OnInit() {
     }
 
     EventSetTimer(Poll_Seconds);
-    Print("[Executor MT5 v1.13] Initialized"
+    Print("[Executor MT5 v1.14] Initialized"
           " | symbols=", Symbol_List, " | timeframe=", TFToString(Signal_Timeframe),
           " | magic=", Magic_Number,
           " | max_pos=", Max_Open_Positions, " | portfolio=", Portfolio_Max_Risk_Pct, "%"
@@ -1022,11 +1033,12 @@ void NotifyBackend(ulong ticket, string sym, string dir,
         "{\"ticket\":%lld,\"symbol\":\"%s\",\"direction\":\"%s\","
         "\"entry_price\":%.6f,\"stop_loss\":%.6f,\"take_profit\":%.6f,"
         "\"lot_size\":%.2f,\"account_equity\":%.2f,\"risk_amount\":%.2f,"
-        "\"atr_at_entry\":%.6f,\"session\":\"%s\","
+        "\"atr_at_entry\":%.6f,\"session\":\"%s\",\"timeframe\":\"%s\","          // FIX G (v1.14): timeframe added
         "\"signal_score\":%d,\"signal_rsi\":%.4f,\"signal_adx\":%.4f,"
         "\"signal_di_plus\":%.4f,\"signal_di_minus\":%.4f,"
         "\"signal_ema50\":%.6f,\"signal_ema200\":%.6f}",
         (long)ticket, sym, dir, price, sl, tp, lots, equity, risk_amt, atr, GetSession(),
+        TFToString(Signal_Timeframe),                                              // FIX G (v1.14)
         sc, rsi, adx, dip, dim, e50, e200);
     string url = FastAPI_Base + "/trades/open";
     uchar post_data[], result[]; string rh;
