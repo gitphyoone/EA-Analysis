@@ -649,13 +649,12 @@
         <select id="market-symbol">
           <option value="EURUSD">EURUSD</option>
           <option value="GBPUSD">GBPUSD</option>
-          <option value="USDJPY">USDJPY</option>
           <option value="AUDUSD">AUDUSD</option>
           <option value="USDCAD">USDCAD</option>
-          <option value="USDCHF">USDCHF</option>
-          <option value="NZDUSD">NZDUSD</option>
           <option value="GBPJPY">GBPJPY</option>
-          <option value="EURJPY">EURJPY</option>
+          <option value="NZDUSD">NZDUSD</option>
+          <option value="USDCHF">USDCHF</option>
+          <option value="EURGBP">EURGBP</option>
         </select>
         <select id="market-timeframe">
           <option value="H1">H1</option>
@@ -1017,7 +1016,7 @@
 const BASE    = "";   // same origin — FastAPI serves both API and dashboard
 const HEADERS = {};   // add {"X-API-Key":"..."} in production
 
-const SYMBOLS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","GBPJPY","EURJPY"];
+const SYMBOLS = ["EURUSD","GBPUSD","AUDUSD","USDCAD","GBPJPY","NZDUSD","USDCHF","EURGBP"];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function fmt(n, d = 2) {

@@ -27,6 +27,7 @@ class TradeIn(BaseModel):
     risk_amount: Decimal
     atr_at_entry:    Optional[Decimal] = None
     session:         Optional[str] = None
+    timeframe:       Optional[str] = None  
     signal_score:    Optional[Decimal] = None
     signal_rsi:      Optional[Decimal] = None
     signal_adx:      Optional[Decimal] = None

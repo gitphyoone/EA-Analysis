@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS market_data (
     ema20       DECIMAL(18,6),
     ema50       DECIMAL(18,6),
     ema200      DECIMAL(18,6),
+    ema50_prev  DECIMAL(18,6),
+    ema200_prev DECIMAL(18,6),
     rsi14       DECIMAL(10,4),
     adx14       DECIMAL(10,4),
     di_plus     DECIMAL(10,4),

@@ -32,6 +32,7 @@ class Trade(Base):
     risk_amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
     atr_at_entry: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 6))
     session: Mapped[Optional[str]] = mapped_column(String(20))
+    timeframe: Mapped[Optional[str]] = mapped_column(String(10))      # ← ADD
     opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -63,6 +64,7 @@ class TradeHistory(Base):
     duration_minutes: Mapped[Optional[int]] = mapped_column(Integer)
     exit_reason: Mapped[Optional[str]] = mapped_column(String(30))
     session: Mapped[Optional[str]] = mapped_column(String(20))
+    timeframe: Mapped[Optional[str]] = mapped_column(String(10))      # ← ADD
     signal_score:    Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
     signal_rsi:      Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
     signal_adx:      Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 4))
@@ -77,4 +79,5 @@ class TradeHistory(Base):
     __table_args__ = (
         Index("idx_trade_history_closed", "closed_at"),
         Index("idx_trade_history_symbol", "symbol", "closed_at"),
+        Index("idx_trade_history_symbol_tf", "symbol", "timeframe", "closed_at"),   # ← ADD
     )
