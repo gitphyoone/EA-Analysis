@@ -85,7 +85,7 @@
 // ── Inputs ──────────────────────────────────────────────────────────
 input string           FastAPI_Base         = "http://127.0.0.1";
 input string           API_Key              = "f9e369ad5592a0dcd33c78c4e33bd382";
-input string            Symbol_List          = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY";
+input string            Symbol_List          = "EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,GBPJPY,NZDUSD,USDCHF,EURGBP";
 input ENUM_TIMEFRAMES   Signal_Timeframe     = PERIOD_H1;  // FIX E (v1.12): drives indicators + signal URL + reject-log
 input int               Poll_Seconds         = 10;
 input long              Magic_Number         = 19001;      // MUST differ between the H1 and H4 instances
